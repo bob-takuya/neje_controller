@@ -64,7 +64,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
-            libssl-dev
+            libssl-dev \
+            libudev-dev
 
       - name: Install npm dependencies
         run: npm ci
