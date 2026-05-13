@@ -1,0 +1,349 @@
+:root {
+  --bg: #1a1a1a;
+  --panel: #222;
+  --panel-alt: #2a2a2a;
+  --border: #333;
+  --text: #eaeaea;
+  --muted: #888;
+  --accent: #4dabf7;
+  --accent-2: #74c0fc;
+  --ok: #51cf66;
+  --warn: #ffd43b;
+  --err: #ff6b6b;
+  --tx: #8ce99a;
+  --rx: #ffd8a8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+button,
+select,
+input {
+  background: #2d2d2d;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+button {
+  cursor: pointer;
+  transition: background 120ms;
+}
+button:hover:not(:disabled) {
+  background: #3a3a3a;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+button.primary {
+  background: #1e5fb5;
+  border-color: #1e5fb5;
+  color: white;
+}
+button.primary:hover:not(:disabled) {
+  background: #2774dc;
+}
+button.danger {
+  background: #a33;
+  border-color: #a33;
+  color: white;
+}
+button.danger:hover:not(:disabled) {
+  background: #c44;
+}
+button.stop {
+  background: #d9480f;
+  border-color: #d9480f;
+  color: white;
+}
+
+input[type="number"] {
+  width: 80px;
+}
+input[type="text"] {
+  flex: 1;
+  min-width: 100px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+header {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  background: var(--panel);
+}
+header h1 {
+  margin: 0 0 6px 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 280px 1fr 320px;
+  gap: 10px;
+  padding: 10px;
+  overflow: hidden;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+.col-center {
+  min-width: 0;
+  /* Center column hosts the canvas + log; let it manage its own overflow. */
+  overflow: hidden;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+.panel h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.panel h4 {
+  margin: 4px 0 2px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.chk {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  color: var(--muted);
+}
+.muted {
+  color: var(--muted);
+  font-size: 11px;
+}
+.err {
+  color: var(--err);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Connection */
+.connection-bar .row {
+  gap: 6px;
+}
+
+/* Position readout */
+.pos-panel .state {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 11px;
+  background: #444;
+}
+.state-idle { background: #2b8a3e; }
+.state-run { background: #1971c2; }
+.state-jog { background: #5f3dc4; }
+.state-hold { background: #e67700; }
+.state-alarm { background: #c92a2a; }
+.state-home { background: #087f5b; }
+.state-unknown { background: #444; }
+
+.pos-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 4px;
+}
+.pos-grid div {
+  background: var(--panel-alt);
+  border-radius: 4px;
+  padding: 4px 6px;
+  display: flex;
+  flex-direction: column;
+}
+.pos-grid label {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.pos-grid span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* Jog */
+.jog-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-top: 4px;
+}
+.jog-grid button {
+  padding: 10px 0;
+  font-size: 16px;
+}
+
+/* Job */
+.progress {
+  position: relative;
+  height: 16px;
+  background: #2a2a2a;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+.progress .bar {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, #1971c2, #339af0);
+  width: 0%;
+  transition: width 150ms ease;
+}
+.progress span {
+  position: relative;
+  z-index: 1;
+  display: block;
+  text-align: center;
+  line-height: 16px;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+}
+
+/* DXF panel */
+.dxf-panel .bounds {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.dxf-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.dxf-panel th,
+.dxf-panel td {
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.dxf-panel th {
+  color: var(--muted);
+  font-weight: 500;
+}
+.dxf-panel td input[type="number"] {
+  width: 60px;
+}
+.dxf-panel .layers {
+  /* Cap the layer table so a 25+ cell test pattern doesn't blow out the
+     right column. The table itself scrolls; the rest of the panel stays put. */
+  max-height: 360px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 5px;
+  border-radius: 2px;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+}
+
+/* DXF preview */
+.dxf-preview {
+  flex: 1;
+  min-height: 200px;
+  background: #111;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.dxf-preview canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Log */
+.log-panel {
+  flex: 0 0 260px;
+  min-height: 180px;
+}
+.log {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  min-height: 100px;
+}
+.log-line {
+  display: flex;
+  gap: 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line .lvl {
+  color: var(--muted);
+  flex: 0 0 32px;
+  font-size: 10px;
+}
+.log-line.l-tx .lvl,
+.log-line.l-tx .msg { color: var(--tx); }
+.log-line.l-rx .lvl,
+.log-line.l-rx .msg { color: var(--rx); }
+.log-line.l-warn .msg { color: var(--warn); }
+.log-line.l-error .msg { color: var(--err); }
+.send-row input {
+  font-family: ui-monospace, monospace;
+}

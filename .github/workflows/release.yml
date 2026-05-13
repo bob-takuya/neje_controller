@@ -1,0 +1,94 @@
+name: release
+
+# Builds installers for every supported OS using GitHub-hosted runners,
+# then attaches them to a draft GitHub Release.
+#
+# Triggers:
+#   - push of a tag like v0.1.0          → builds and uploads to a draft release
+#   - manual run via "workflow_dispatch" → builds, uploads artifacts only
+#
+# Windows builds happen on `windows-latest`, which is the most common way to
+# produce a Tauri Windows installer without owning a Windows machine.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      # Linux needs the WebKit / GTK / AppIndicator dev libraries to build the
+      # tauri webview wrapper. The runner image doesn't include them.
+      - name: Install Linux build deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # When the workflow is run manually (no tag), the tauri-action above
+      # skips the release step. Upload artifacts directly so they're still
+      # accessible from the Actions run page.
+      - name: Upload artifacts (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.args }}
+          path: |
+            src-tauri/target/release/bundle/**/*
+            src-tauri/target/*/release/bundle/**/*
+          if-no-files-found: ignore
