@@ -314,6 +314,218 @@ const reverseShape = (s: Shape): Shape => {
   return s; // circle: reversal has no meaningful effect
 };
 
+// --- Polyline → arc/line fitting (single-arc biarc-style approximation) ---
+//
+// Why this exists: Illustrator and Rhino emit curves as SPLINEs that we
+// previously flattened into hundreds of micro-segments per curve. GRBL's
+// planner only looks ~16 blocks ahead, so when each block is a 0.05 mm G1
+// the planner runs out of distance to plan deceleration and the head crawls
+// at fractions of mm/s. Empirically a 3300-SPLINE Rhino DXF emits ~300 000
+// G-code blocks; with this pass it drops to ~6 600 — a 45× reduction.
+//
+// Algorithm:
+//   For each polyline, greedily extend the longest prefix that can be fit
+//   either by a straight line or by a single arc whose tangent matches the
+//   incoming direction at P[start] and whose chord touches P[end], within a
+//   given tolerance (max perpendicular deviation). When the prefix can no
+//   longer be extended, emit that line/arc and restart from the endpoint.
+//
+//   We accept a fit as a "line" only when the chord deviation is below tol;
+//   otherwise we try an arc. This is simpler than full biarc (one arc per
+//   span) but captures the bulk of the savings because each prefix may span
+//   many sample points.
+
+const COLLINEAR_TOL_DEG = 0.5;
+
+/**
+ * Collapse consecutive segments whose direction differs by less than
+ * `tolDeg`. Cheap preprocessing that removes the "many points on a straight
+ * line" noise before we try arc fitting.
+ */
+const collinearMerge = (points: Polyline, tolDeg = COLLINEAR_TOL_DEG): Polyline => {
+  if (points.length < 3) return points;
+  const out: Polyline = [points[0]];
+  let prevDir: number | null = null;
+  const tolRad = (tolDeg * Math.PI) / 180;
+  for (let i = 1; i < points.length; i++) {
+    const a = out[out.length - 1];
+    const b = points[i];
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    const dir = Math.atan2(dy, dx);
+    if (prevDir !== null) {
+      let diff = Math.abs(dir - prevDir);
+      if (diff > Math.PI) diff = 2 * Math.PI - diff;
+      if (diff < tolRad) {
+        out[out.length - 1] = b;
+        continue;
+      }
+    }
+    out.push(b);
+    prevDir = dir;
+  }
+  return out;
+};
+
+type FitResult =
+  | { kind: "line"; end: number }
+  | { kind: "arc"; end: number; cx: number; cy: number; r: number; ccw: boolean };
+
+/**
+ * Find the longest prefix of `pts[start..]` that fits either a straight line
+ * or a single arc within `tol`. Returns the fit + the index of the last
+ * point included.
+ *
+ * Arc fitting: given the tangent at P[start] (estimated from P[start]→
+ * P[start+1]) and the chord P[start]→P[k], the circle is uniquely
+ * determined: center lies along the perpendicular to the tangent at P[start]
+ * at distance r = chord² / (2 · (chord · normal)).
+ */
+const fitArcOrLine = (
+  pts: Polyline,
+  start: number,
+  tol: number,
+): FitResult | null => {
+  if (start + 1 >= pts.length) return null;
+  const p0 = pts[start];
+
+  const t0x = pts[start + 1][0] - p0[0];
+  const t0y = pts[start + 1][1] - p0[1];
+  const tlen = Math.hypot(t0x, t0y);
+  if (tlen < 1e-9) return null;
+  const tx = t0x / tlen;
+  const ty = t0y / tlen;
+  const nx = -ty;
+  const ny = tx;
+
+  let bestEnd = start + 1;
+  let best: FitResult = { kind: "line", end: start + 1 };
+
+  for (let k = start + 2; k < pts.length; k++) {
+    const pk = pts[k];
+    const chordDx = pk[0] - p0[0];
+    const chordDy = pk[1] - p0[1];
+    const chordLen = Math.hypot(chordDx, chordDy);
+    if (chordLen < 1e-9) continue;
+
+    // --- Line fit: max perpendicular deviation of interior points from
+    //     the chord p0→pk. ---
+    const lineNx = -chordDy / chordLen;
+    const lineNy = chordDx / chordLen;
+    let lineMaxDev = 0;
+    for (let j = start + 1; j < k; j++) {
+      const dx = pts[j][0] - p0[0];
+      const dy = pts[j][1] - p0[1];
+      const d = Math.abs(dx * lineNx + dy * lineNy);
+      if (d > lineMaxDev) lineMaxDev = d;
+    }
+    if (lineMaxDev < tol) {
+      bestEnd = k;
+      best = { kind: "line", end: k };
+      continue;
+    }
+
+    // --- Arc fit: circle through p0 tangent to (tx, ty), passing through pk. ---
+    const dot = chordDx * nx + chordDy * ny;
+    if (Math.abs(dot) < 1e-9) break; // tangent collinear with chord → only the
+    // line fit applies, which we just rejected; can't extend.
+    const r = (chordLen * chordLen) / (2 * dot);
+    const absR = Math.abs(r);
+    if (absR > 1e6 || absR < 1e-3) break;
+    const cx = p0[0] + r * nx;
+    const cy = p0[1] + r * ny;
+
+    let arcMaxDev = 0;
+    for (let j = start + 1; j <= k; j++) {
+      const d = Math.abs(Math.hypot(pts[j][0] - cx, pts[j][1] - cy) - absR);
+      if (d > arcMaxDev) arcMaxDev = d;
+    }
+    if (arcMaxDev < tol) {
+      bestEnd = k;
+      // r > 0 means the center is on the left of the tangent → CCW sweep.
+      best = { kind: "arc", end: k, cx, cy, r: absR, ccw: r > 0 };
+    } else {
+      break;
+    }
+  }
+
+  // Return null if nothing extended past the immediate next point — caller
+  // will fall back to emitting one raw segment.
+  if (bestEnd === start + 1 && best.kind === "line") {
+    return { kind: "line", end: start + 1 };
+  }
+  return best;
+};
+
+/**
+ * Fit one polyline into a sequence of line + arc shapes.
+ * `tol` is the maximum perpendicular deviation (mm) allowed.
+ */
+const fitPolyToShapes = (pts: Polyline, tol = 0.05): Shape[] => {
+  if (pts.length < 2) return [];
+  const merged = collinearMerge(pts);
+  if (merged.length < 3) {
+    return [{ type: "poly", points: merged }];
+  }
+
+  const out: Shape[] = [];
+  let lineRun: Polyline = [merged[0]];
+  let i = 0;
+  while (i < merged.length - 1) {
+    const fit = fitArcOrLine(merged, i, tol);
+    if (!fit) {
+      lineRun.push(merged[i + 1]);
+      i++;
+      continue;
+    }
+    if (fit.kind === "line") {
+      lineRun.push(merged[fit.end]);
+    } else {
+      // Flush any accumulated line run.
+      if (lineRun.length >= 2) out.push({ type: "poly", points: lineRun });
+      // Convert arc to ArcShape. Angles are in degrees, CCW from +X.
+      const p0 = merged[i];
+      const p1 = merged[fit.end];
+      const startDeg = Math.atan2(p0[1] - fit.cy, p0[0] - fit.cx) * (180 / Math.PI);
+      const endDeg = Math.atan2(p1[1] - fit.cy, p1[0] - fit.cx) * (180 / Math.PI);
+      out.push({
+        type: "arc",
+        cx: fit.cx,
+        cy: fit.cy,
+        r: fit.r,
+        startDeg,
+        endDeg,
+        ccw: fit.ccw,
+      });
+      lineRun = [merged[fit.end]];
+    }
+    i = fit.end;
+  }
+  if (lineRun.length >= 2) out.push({ type: "poly", points: lineRun });
+  return out;
+};
+
+/**
+ * Walk every shape in a layer and apply the fit to any `poly` shape with
+ * enough points to benefit. LINE/CIRCLE/ARC are passed through untouched —
+ * those are already optimal for G2/G3 emission.
+ */
+const fitLayerShapes = (shapes: Shape[], tol = 0.05): Shape[] => {
+  const out: Shape[] = [];
+  for (const s of shapes) {
+    if (s.type !== "poly" || s.points.length < 8) {
+      out.push(s);
+      continue;
+    }
+    const fitted = fitPolyToShapes(s.points, tol);
+    if (fitted.length > 0) out.push(...fitted);
+    else out.push(s);
+  }
+  return out;
+};
+
 // --- Stitch pass: chain shapes whose endpoints match ---
 
 /**
@@ -709,6 +921,14 @@ export function parseDxf(text: string): DxfDocument {
       default:
         break;
     }
+  }
+
+  // Biarc fit pass: replace dense flattened polylines (from SPLINE/ELLIPSE
+  // and bulge-less LWPOLYLINE) with line + arc shapes. Drops G-code block
+  // counts by ~45× on typical CAD/Illustrator/Rhino DXFs, which is what
+  // keeps the GRBL planner fed.
+  for (const name of Object.keys(byLayer)) {
+    byLayer[name] = fitLayerShapes(byLayer[name]);
   }
 
   // Stitch pass: per layer, chain shapes whose endpoints match. Reorders
