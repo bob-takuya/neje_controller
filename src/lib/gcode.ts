@@ -60,8 +60,18 @@ const fmt = (n: number, digits = 3) => {
   return v.replace(/\.?0+$/, "") || "0";
 };
 
+// Threshold for "these two MCS points are the same shape boundary".
+//
+// Used to decide whether a shape chains onto the previous one — when they
+// chain, we skip the M5/G0/M4 cycle and keep the laser burning across the
+// boundary. The bar must be looser than the biarc fitter's tolerance
+// (0.05 mm, see dxf.ts), otherwise every adjacent line+arc emits a
+// laser-off/on cycle and the controller stalls on each M5 (each one drains
+// the planner). At 0.1 mm any visible gap is well below kerf width and the
+// stitch pass in dxf.ts already coalesces points within 0.01 mm.
+const CHAIN_TOL_MM = 0.1;
 const almostSame = (a: [number, number], b: [number, number]) =>
-  Math.abs(a[0] - b[0]) < 1e-4 && Math.abs(a[1] - b[1]) < 1e-4;
+  Math.abs(a[0] - b[0]) < CHAIN_TOL_MM && Math.abs(a[1] - b[1]) < CHAIN_TOL_MM;
 
 /** Below this we skip the G1 — 2× motor-step resolution on NEJE MAX4. */
 const MIN_SEG_MM = 0.025;
@@ -181,14 +191,33 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
   out.push(`; placement: (${fmt(placement.x)}, ${fmt(placement.y)}) mm in MCS`);
   out.push("G21"); // mm
   out.push("G90"); // absolute positioning
-  out.push("M5"); // laser off to start
+  // Force GRBL into laser mode. In laser mode, S is treated as a power level
+  // (not spindle RPM), and crucially G0 *automatically forces S to 0* so we
+  // can rapid between shapes without explicitly toggling M5/M4. This is what
+  // makes shape-to-shape transitions instant instead of stalling ~1s on each
+  // M5 (which would otherwise drain the planner before responding ok).
+  // NEJE MAX4 ships with $32=1, but force it for safety in case someone has
+  // a stale machine.
+  out.push("$32=1");
+  out.push("M5"); // known-off start state
 
-  const laserOn = params.dynamicPower ? "M4" : "M3";
+  // In dynamic mode (M4) we issue ONE M4 at the start of the job and rely on
+  // the GRBL laser-mode behavior above to gate the beam during G0 rapids.
+  // No more M5/G0/M4 cycle per shape — that was ~5000 sync stalls on the
+  // Rhino test file.
+  //
+  // In constant mode (M3) the laser stays at full power during G0 rapids, so
+  // we MUST keep emitting M5/G0/M3 around each shape boundary. M3 users
+  // typically know this and accept the cost.
+  const dynamic = params.dynamicPower;
+  const laserOn = dynamic ? "M4" : "M3";
 
   const byName: Record<string, Shape[]> = {};
   for (const l of doc.layers) byName[l.name] = l.shapes;
 
   let lastMcs: [number, number] | null = null;
+  let lastPower: number | null = null; // Last S value we sent. Lets us re-emit
+                                       // only on power change in dynamic mode.
 
   for (const layer of params.layers) {
     if (!layer.enabled) continue;
@@ -199,11 +228,19 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
       `; --- layer: ${layer.name} (power=${layer.power}, feed=${layer.feed}, passes=${layer.passes}) ---`,
     );
 
+    if (dynamic && lastPower !== layer.power) {
+      // Set/refresh power for this layer; M4 stays on for the whole job.
+      out.push(`${laserOn} S${fmt(layer.power, 0)}`);
+      lastPower = layer.power;
+    }
+
     for (let pass = 0; pass < Math.max(1, layer.passes); pass++) {
       if (layer.passes > 1) {
         out.push(`; pass ${pass + 1}/${layer.passes}`);
       }
-      let laserActive = false;
+      let laserActive = dynamic; // In dynamic mode the beam is "armed" the
+                                 // whole job (G0 auto-disables it). In
+                                 // constant mode we toggle per shape.
       for (const shape of shapes) {
         const em = emitShape(shape, placement, layer.feed);
         if (!em || em.body.length === 0) continue;
@@ -213,8 +250,17 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
         if (chained) {
           // Shapes chain continuously (e.g. poly→arc from a split
           // LWPOLYLINE). Keep the laser on — no gap move needed.
+        } else if (dynamic) {
+          // M4 mode: just rapid to the new start. The laser auto-off during
+          // G0 (laser-mode $32=1) means we don't need M5/M3 dance, and the
+          // planner doesn't stall waiting on a spindle sync.
+          if (!lastMcs || !almostSame(lastMcs, em.start)) {
+            out.push(`G0 X${fmt(em.start[0])} Y${fmt(em.start[1])}`);
+          }
+          laserActive = true;
         } else {
-          // Gap between shapes: turn laser off, rapid to start, turn on.
+          // M3 (constant) mode: full M5/G0/M3 cycle to avoid burning during
+          // rapids.
           if (laserActive) out.push("M5");
           if (!lastMcs || !almostSame(lastMcs, em.start)) {
             out.push(`G0 X${fmt(em.start[0])} Y${fmt(em.start[1])}`);
@@ -228,8 +274,10 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
       }
     }
 
-    // Laser off between layers.
-    out.push("M5");
+    // In M3 mode we drop the beam between layers as a safety pause. In M4
+    // mode the rapid to the next layer will auto-disable the beam — no need
+    // for an explicit sync stall here.
+    if (!dynamic) out.push("M5");
   }
 
   if (params.returnHome) {
