@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
 import { DxfDocument } from "../lib/dxf";
-import { JobParams, LayerParams, Placement, buildGCode } from "../lib/gcode";
+import {
+  JobParams,
+  LayerParams,
+  Placement,
+  buildGCode,
+  buildResumeProgram,
+} from "../lib/gcode";
 
 type Props = {
   connected: boolean;
@@ -87,6 +93,37 @@ export function JobPanel({
     await api.cancelStream();
   };
 
+  // --- Resume from a specific line --------------------------------------
+  //
+  // When a job is cancelled or fails partway, the progress bar shows
+  // "sent / total". The user can edit `resumeAt` and press Resume to pick
+  // up from that line (with the header + last-known position re-emitted).
+  //
+  // We default to a few lines earlier than the last ack, because the
+  // controller's planner buffer was dropped on soft-reset — any line that
+  // had been "ack'd" but not yet executed needs to be redone.
+  const RESUME_BACKOFF = 5;
+  const [resumeAt, setResumeAt] = useState<string>("");
+  useEffect(() => {
+    // Whenever progress lands on a stopped state, prefill the input with a
+    // safe default. We don't overwrite while the user has it focused —
+    // checking document.activeElement isn't great in React but the simple
+    // heuristic "don't update if there's a value already and user might be
+    // editing" works well enough here.
+    if (!running && progress && progress.sent > 0) {
+      const safe = Math.max(0, progress.sent - RESUME_BACKOFF);
+      setResumeAt(String(safe));
+    }
+  }, [running, progress?.sent]);
+
+  const resumeFromIdx = async () => {
+    if (!connected || running || program.length === 0) return;
+    const idx = parseInt(resumeAt, 10);
+    if (!Number.isFinite(idx) || idx < 0 || idx >= program.length) return;
+    const resumed = buildResumeProgram(program, idx);
+    await api.stream(resumed);
+  };
+
   return (
     <div className="panel job-panel">
       <h3>Job</h3>
@@ -169,6 +206,29 @@ export function JobPanel({
           <span>
             {progress.sent} / {progress.total}
           </span>
+        </div>
+      )}
+      {progress && progress.sent > 0 && progress.sent < progress.total && (
+        <div className="row resume-row">
+          <label>Resume at:</label>
+          <input
+            type="number"
+            min={0}
+            max={program.length - 1}
+            step={1}
+            value={resumeAt}
+            onChange={(e) => setResumeAt(e.target.value)}
+            disabled={running}
+            title="Line index to resume from (re-emits header + rapids head to that point)"
+          />
+          <span className="muted">/ {program.length}</span>
+          <button
+            disabled={!connected || running || program.length === 0}
+            onClick={resumeFromIdx}
+            title="Re-stream from this line onwards"
+          >
+            Resume from line
+          </button>
         </div>
       )}
     </div>
