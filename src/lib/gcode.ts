@@ -290,6 +290,97 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
   return out;
 }
 
+// --- Resume from a stopped job ----------------------------------------------
+//
+// When a job is cancelled or errors out partway, we want to be able to pick
+// it back up without redoing finished cuts. Plain `program.slice(startIdx)`
+// is not enough: the controller has been soft-reset (by our cancel logic) so
+// modal state — units (G21), distance (G90), feed, laser mode, the active M4
+// power — is gone. We also need to physically rapid the head to the right
+// position before resuming, otherwise the very first G1 cuts a straight line
+// from wherever the head currently sits to wherever we left off.
+//
+// `buildResumeProgram` rebuilds those pieces:
+//   1. Copy every "header" line from the original program (everything before
+//      the first motion command).
+//   2. Re-emit `$32=1` + `M5` + the most recent `M3/M4 S<power>` that was
+//      active at startIdx (walked from the start of the program).
+//   3. Rapid (G0) to the last known XY position just before startIdx.
+//   4. Append `program[startIdx..]`.
+//
+// Note: this depends on the program being built by `buildGCode` above. Hand-
+// crafted programs that don't follow our laser-mode convention may not
+// resume correctly.
+
+const X_RE = /\bX([-\d.]+)/;
+const Y_RE = /\bY([-\d.]+)/;
+const S_RE = /\bS([\d.]+)/;
+const MOTION_RE = /^G[0123](?:\b|\s)/;
+const LASER_ON_RE = /^(M3|M4)\b/;
+
+/**
+ * Rebuild a resumable program that continues `program` from `startIdx`.
+ * `startIdx` is interpreted as an index into the ORIGINAL program (0-based).
+ * Out-of-range values are clamped.
+ */
+export function buildResumeProgram(
+  program: string[],
+  startIdx: number,
+): string[] {
+  if (program.length === 0) return [];
+  const i = Math.max(0, Math.min(startIdx, program.length));
+  if (i === 0) return program.slice();
+
+  // Walk lines [0, i) to recover modal state and last position.
+  let lastX: number | null = null;
+  let lastY: number | null = null;
+  let activeLaser: string | null = null; // e.g. "M4 S600"
+  let firstMotion = -1;
+
+  for (let k = 0; k < i; k++) {
+    const line = program[k];
+    if (firstMotion < 0 && MOTION_RE.test(line)) firstMotion = k;
+    const mx = line.match(X_RE);
+    const my = line.match(Y_RE);
+    if (mx) lastX = parseFloat(mx[1]);
+    if (my) lastY = parseFloat(my[1]);
+    if (LASER_ON_RE.test(line)) {
+      // Snapshot the current laser-on command (including any S value).
+      const s = line.match(S_RE);
+      const mode = line.startsWith("M3") ? "M3" : "M4";
+      activeLaser = s ? `${mode} S${s[1]}` : mode;
+    } else if (/^M5\b/.test(line)) {
+      activeLaser = null;
+    }
+  }
+
+  // Header = everything before the first motion. If we never saw a motion,
+  // treat the entire prefix as header.
+  const headerEnd = firstMotion < 0 ? i : firstMotion;
+  const out: string[] = [];
+  out.push(`; --- RESUME from line ${i} of ${program.length} ---`);
+  for (let k = 0; k < headerEnd; k++) out.push(program[k]);
+
+  // Re-arm modal state explicitly even if it was in the header. Idempotent.
+  if (!out.some((l) => l.trim() === "G21")) out.push("G21");
+  if (!out.some((l) => l.trim() === "G90")) out.push("G90");
+  if (!out.some((l) => l.trim() === "$32=1")) out.push("$32=1");
+  // Make sure the laser is off before we rapid into position.
+  out.push("M5");
+
+  // Rapid to last known XY.
+  if (lastX !== null && lastY !== null) {
+    out.push(`G0 X${fmt(lastX)} Y${fmt(lastY)}`);
+  }
+
+  // Re-arm laser mode/power if it was active when we stopped.
+  if (activeLaser) out.push(activeLaser);
+
+  // Tail: the lines we still need to send.
+  for (let k = i; k < program.length; k++) out.push(program[k]);
+  return out;
+}
+
 /** Helper: turn DxfDocument layers into default LayerParams list. */
 export function defaultLayerParams(doc: DxfDocument): LayerParams[] {
   return doc.layers.map((l) => ({
