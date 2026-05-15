@@ -13,10 +13,11 @@
 //! For a single user streaming a DXF over USB, (a) is plenty and a lot easier
 //! to reason about. That's what we implement here.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serialport::{SerialPort, SerialPortType};
 use tauri::{AppHandle, Emitter};
@@ -313,7 +314,6 @@ fn run_worker(
 
             WorkerCmd::StreamLines(lines) => {
                 cancel_flag.store(false, Ordering::SeqCst);
-                // Drain stale rx lines before starting.
                 while rx_line_rx.try_recv().is_ok() {}
 
                 let filtered: Vec<String> = lines
@@ -321,47 +321,14 @@ fn run_worker(
                     .filter_map(|l| grbl::normalize_line(l))
                     .collect();
                 let total = filtered.len();
-                let mut sent = 0usize;
-                let mut error: Option<String> = None;
-                let mut was_cancelled = false;
+                let (sent, was_cancelled, error) = stream_with_char_count(
+                    &mut port,
+                    &filtered,
+                    &rx_line_rx,
+                    &cancel_flag,
+                    &app,
+                );
 
-                for line in filtered.iter() {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        was_cancelled = true;
-                        break;
-                    }
-                    let _ = app.emit(events::LOG, LogLine::tx(line.clone()));
-                    match send_and_wait_ok(&mut port, line, &rx_line_rx, &cancel_flag) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            error = Some(e);
-                            break;
-                        }
-                    }
-                    // send_and_wait_ok returns early on cancel — recheck so
-                    // we don't count the unfinished line as "sent".
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        was_cancelled = true;
-                        break;
-                    }
-                    sent += 1;
-                    // Emit progress at most every few lines to avoid flooding.
-                    if sent % 10 == 0 || sent == total {
-                        let _ = app.emit(
-                            events::PROGRESS,
-                            Progress {
-                                sent,
-                                total,
-                                line: line.clone(),
-                            },
-                        );
-                    }
-                }
-
-                // If cancelled mid-stream, decisively stop the controller.
-                // Doing this inline (rather than relying on a queued
-                // WorkerCmd::Cancel) is what makes the cancel button
-                // responsive — the outer command loop is still blocked here.
                 if was_cancelled {
                     let _ = port.write_all(&[grbl::RT_FEED_HOLD]);
                     std::thread::sleep(Duration::from_millis(100));
@@ -372,7 +339,6 @@ fn run_worker(
                     );
                 }
 
-                // Make sure the final progress frame is emitted.
                 let _ = app.emit(
                     events::PROGRESS,
                     Progress {
@@ -462,4 +428,156 @@ fn send_and_wait_ok(
             }
         }
     }
+}
+
+/// GRBL 1.1's RX serial buffer is 128 bytes. We keep our high-water below
+/// that to leave room for the controller's own line accumulator and for the
+/// occasional realtime status report byte that doesn't go through the line
+/// buffer but is still parsed by the same routine.
+const GRBL_RX_BUF_BYTES: usize = 120;
+
+/// Character-counting streamer.
+///
+/// Why this exists: the old "send line, wait for ok" loop produces a host →
+/// GRBL → host round trip on every block. With small geometry (<1 mm) the
+/// round-trip latency (Windows USB-CDC easily 10–30 ms) becomes the bottleneck
+/// and the GRBL planner runs dry — the head visibly pauses between segments.
+/// Character counting keeps GRBL's 128-byte RX buffer near-full at all times
+/// so the planner always has dozens of blocks queued and the head moves
+/// continuously.
+///
+/// The protocol is the one documented in the official `simple_stream.py` and
+/// `streaming` GRBL wiki page:
+///   1. Keep a FIFO of byte-lengths for every line that's been sent but not
+///      acked.
+///   2. Send the next line only if it fits within `GRBL_RX_BUF_BYTES` minus
+///      the FIFO sum.
+///   3. On every "ok"/"error" reply, pop the oldest entry from the FIFO. An
+///      error refers to the OLDEST inflight line (that's the one that just
+///      finished parsing).
+///   4. Send a `?` realtime byte once per second so the UI status widget
+///      stays alive.
+///
+/// Returns `(sent_count, was_cancelled, error)`.
+fn stream_with_char_count(
+    port: &mut Box<dyn SerialPort>,
+    lines: &[String],
+    rx: &std::sync::mpsc::Receiver<String>,
+    cancel: &Arc<AtomicBool>,
+    app: &AppHandle,
+) -> (usize, bool, Option<String>) {
+    let total = lines.len();
+    // Byte counts of lines sent-but-not-acked, in FIFO order.
+    let mut inflight: VecDeque<usize> = VecDeque::new();
+    let mut inflight_bytes: usize = 0;
+
+    // Index of the next line to send.
+    let mut next_to_send = 0usize;
+    // Number of lines acked. This is the value reported as progress because
+    // ack is when GRBL has committed the line to its planner — i.e. it WILL
+    // be executed barring a fault.
+    let mut acked = 0usize;
+    // Last index we emitted a progress event for (avoid flooding the UI bus).
+    let mut last_progress_emitted = 0usize;
+
+    let mut last_status_ping = Instant::now();
+    let mut error: Option<String> = None;
+    let mut was_cancelled = false;
+
+    // The send-as-much-as-fits / drain-acks dance. Loop ends when every line
+    // has been acked, or we hit an error / cancel.
+    while acked < total {
+        if cancel.load(Ordering::SeqCst) {
+            was_cancelled = true;
+            break;
+        }
+
+        // 1. Send everything that fits in the GRBL RX buffer.
+        while next_to_send < total {
+            let line = &lines[next_to_send];
+            let bytes = line.len() + 1; // +1 for the trailing '\n'
+            // Even a single long line must fit on its own; if not we'd hang
+            // forever waiting for free space that never comes. Cap the
+            // accumulated inflight to the hardware limit.
+            if !inflight.is_empty() && inflight_bytes + bytes > GRBL_RX_BUF_BYTES {
+                break;
+            }
+            let mut msg = String::with_capacity(bytes);
+            msg.push_str(line);
+            msg.push('\n');
+            if let Err(e) = port.write_all(msg.as_bytes()) {
+                error = Some(format!("serial write: {}", e));
+                return (acked, was_cancelled, error);
+            }
+            // Flush so the OS hands the bytes to the USB stack now; otherwise
+            // some CDC drivers wait for another write to accumulate before
+            // pushing, which stalls us forever waiting on an ack that's
+            // sitting in the host TX buffer.
+            let _ = port.flush();
+            let _ = app.emit(events::LOG, LogLine::tx(line.clone()));
+            inflight.push_back(bytes);
+            inflight_bytes += bytes;
+            next_to_send += 1;
+        }
+
+        // 2. Pump replies. Short timeout so we re-enter the send loop quickly
+        //    once any ack frees a slot. 50ms is well below any noticeable
+        //    pause but generous enough that we don't spin the CPU.
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(reply) => {
+                if grbl::is_ack(&reply) {
+                    if let Some(b) = inflight.pop_front() {
+                        inflight_bytes -= b;
+                        acked += 1;
+                        if acked - last_progress_emitted >= 10 || acked == total {
+                            let _ = app.emit(
+                                events::PROGRESS,
+                                Progress {
+                                    sent: acked,
+                                    total,
+                                    line: lines.get(acked.saturating_sub(1))
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
+                            );
+                            last_progress_emitted = acked;
+                        }
+                    }
+                    // Spurious "ok" with empty inflight (e.g. after soft-reset
+                    // recovery): ignore.
+                } else if grbl::is_error(&reply) {
+                    // The error refers to the oldest inflight line. Surface
+                    // it with that context so the user knows what failed.
+                    let bad_line = lines
+                        .get(next_to_send.saturating_sub(inflight.len()))
+                        .cloned()
+                        .unwrap_or_default();
+                    error = Some(format!(
+                        "GRBL reported {} for '{}'",
+                        reply.trim(),
+                        bad_line,
+                    ));
+                    break;
+                } else if grbl::is_alarm(&reply) {
+                    error = Some(format!("GRBL ALARM {}", reply.trim()));
+                    break;
+                }
+                // Status reports / welcome banners: ignored here; the reader
+                // thread already pushed them to the LOG/STATUS event streams.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if last_status_ping.elapsed() >= Duration::from_millis(900) {
+                    let _ = port.write_all(&[RT_STATUS_QUERY]);
+                    let _ = port.flush();
+                    last_status_ping = Instant::now();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                error = Some("reader thread disconnected".into());
+                break;
+            }
+        }
+    }
+
+    (acked, was_cancelled, error)
 }
