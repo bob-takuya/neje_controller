@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
-import { DxfDocument } from "../lib/dxf";
+import { DxfDocument, flattenShape } from "../lib/dxf";
 import {
   JobParams,
   LayerParams,
@@ -32,6 +32,10 @@ export function JobPanel({
   const [dynamicPower, setDynamicPower] = useState(true);
   const [returnHome, setReturnHome] = useState(true);
   const [dryRun, setDryRun] = useState(false);
+  // Flatten arcs/circles into dense polylines before emitting G-code. Useful
+  // when biarc-fitted arcs render incorrectly (e.g. full-circle bug). With
+  // this on, the program is purely G1/G0 — many more lines, but no G2/G3.
+  const [disableBiarc, setDisableBiarc] = useState(false);
 
   // Local string state for the placement inputs so the user can type freely
   // (including transient invalid states like "" or "-") without fighting
@@ -67,6 +71,23 @@ export function JobPanel({
 
   const program = useMemo(() => {
     if (!doc) return [] as string[];
+    // When biarc is disabled, every arc/circle is replaced with a flattened
+    // polyline so the emitter never sees a G2/G3-eligible shape. The shape
+    // ORDER is preserved, which is what makes anchor-based resume across
+    // biarc-on / biarc-off programs reliable.
+    const effectiveDoc = disableBiarc
+      ? {
+          ...doc,
+          layers: doc.layers.map((layer) => ({
+            ...layer,
+            shapes: layer.shapes.map((s) =>
+              s.type === "poly"
+                ? s
+                : { type: "poly" as const, points: flattenShape(s) },
+            ),
+          })),
+        }
+      : doc;
     const base: JobParams = {
       layers,
       travelFeed,
@@ -74,13 +95,13 @@ export function JobPanel({
       returnHome,
       placement,
     };
-    const lines = buildGCode(doc, base);
+    const lines = buildGCode(effectiveDoc, base);
     if (dryRun) {
       // Replace M3/M4 with M5 so nothing actually fires.
       return lines.map((l) => l.replace(/^(M3|M4)\b.*$/, "M5 ; dry-run"));
     }
     return lines;
-  }, [doc, layers, travelFeed, dynamicPower, returnHome, dryRun, placement]);
+  }, [doc, layers, travelFeed, dynamicPower, returnHome, dryRun, disableBiarc, placement]);
 
   const totalLines = program.length;
 
@@ -183,6 +204,14 @@ export function JobPanel({
         <label className="chk">
           <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
           Dry-run (laser off)
+        </label>
+        <label className="chk">
+          <input
+            type="checkbox"
+            checked={disableBiarc}
+            onChange={(e) => setDisableBiarc(e.target.checked)}
+          />
+          Disable biarc fit (flatten arcs)
         </label>
       </div>
       <div className="row">
