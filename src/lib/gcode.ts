@@ -320,15 +320,42 @@ const LASER_ON_RE = /^(M3|M4)\b/;
 
 /**
  * Rebuild a resumable program that continues `program` from `startIdx`.
- * `startIdx` is interpreted as an index into the ORIGINAL program (0-based).
- * Out-of-range values are clamped.
+ *
+ * `startIdx` is interpreted as a FILTERED line index — the same coordinate
+ * the progress bar reports (sent / total are post-normalize counts; the
+ * Rust side strips blank lines and comments before streaming). We
+ * internally walk the program counting filtered lines so the user's input
+ * matches "stopped at line N" without them needing to know about
+ * comments.
  */
 export function buildResumeProgram(
   program: string[],
   startIdx: number,
 ): string[] {
   if (program.length === 0) return [];
-  const i = Math.max(0, Math.min(startIdx, program.length));
+  // A line "counts" toward the filtered index iff it's not blank or a
+  // comment-only line. Matches the Rust `normalize_line` predicate.
+  const counts = (line: string) => {
+    let s = "";
+    let depth = 0;
+    for (const ch of line) {
+      if (ch === "(") depth++;
+      else if (ch === ")") { if (depth > 0) depth--; }
+      else if (ch === ";" || ch === "\n" || ch === "\r") break;
+      else if (depth === 0) s += ch;
+    }
+    return s.trim().length > 0;
+  };
+  // Translate filtered startIdx → raw index.
+  let i = program.length;
+  let filteredSeen = 0;
+  for (let k = 0; k < program.length; k++) {
+    if (counts(program[k])) {
+      if (filteredSeen === startIdx) { i = k; break; }
+      filteredSeen++;
+    }
+  }
+  i = Math.max(0, Math.min(i, program.length));
   if (i === 0) return program.slice();
 
   // Walk lines [0, i) to recover modal state and last position.
@@ -377,7 +404,30 @@ export function buildResumeProgram(
   if (activeLaser) out.push(activeLaser);
 
   // Tail: the lines we still need to send.
-  for (let k = i; k < program.length; k++) out.push(program[k]);
+  //
+  // Important: when we resume inside a shape (not at a shape boundary), the
+  // first motion line we're about to emit may be a feed move (G1/G2/G3)
+  // that was written WITHOUT an F-word — buildGCode only emits F once per
+  // shape, on the first cut. After a soft-reset the modal feed rate is
+  // gone, so GRBL would reject that first feedless G1 with error:22
+  // "feed rate undefined". To prevent that, walk back through the prefix
+  // to recover the most-recent F value and inject an F-word into the
+  // first G1/G2/G3 line in the tail.
+  let lastFeed: number | null = null;
+  for (let k = i - 1; k >= 0; k--) {
+    const m = program[k].match(/\bF(\d+(?:\.\d+)?)/);
+    if (m) { lastFeed = parseFloat(m[1]); break; }
+  }
+  let injected = false;
+  for (let k = i; k < program.length; k++) {
+    const line = program[k];
+    if (!injected && /^G[123](?:\b|\s)/.test(line) && !/\bF\d/.test(line) && lastFeed != null) {
+      out.push(`${line} F${fmt(lastFeed, 0)}`);
+      injected = true;
+    } else {
+      out.push(line);
+    }
+  }
   return out;
 }
 

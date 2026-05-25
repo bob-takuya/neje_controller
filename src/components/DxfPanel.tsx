@@ -41,6 +41,12 @@ export function DxfPanel({
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // When true, parseDxf skips the biarc fitter entirely. Escape hatch for
+  // DXFs where the fitter mis-renders particular geometry (full-circle bug
+  // on near-flat arcs). The flag must be set BEFORE opening the file because
+  // it changes how the source DXF is parsed; flipping it just rerunning the
+  // emitter on an already-fitted doc would inherit the broken ArcShape data.
+  const [disableBiarc, setDisableBiarc] = useState(false);
 
   const openDxf = async () => {
     setErr(null);
@@ -52,7 +58,7 @@ export function DxfPanel({
       if (!picked || typeof picked !== "string") return;
       setBusy(true);
       const text = await readTextFile(picked);
-      const parsed = parseDxf(text);
+      const parsed = parseDxf(text, { disableBiarc });
       const d = toDesignSpace(parsed);
       onDocLoaded(d, picked.split("/").pop() ?? picked);
       onLayersChange(defaultLayerParams(d));
@@ -69,6 +75,18 @@ export function DxfPanel({
     onLayersChange(next);
   };
 
+  // Cut order = order in the LayerParams array (buildGCode iterates
+  // params.layers in order). Swapping two adjacent entries reorders the
+  // cut sequence with no other side effects — shape order within a layer
+  // is unchanged.
+  const moveLayer = (i: number, delta: number) => {
+    const j = i + delta;
+    if (j < 0 || j >= layers.length) return;
+    const next = layers.slice();
+    [next[i], next[j]] = [next[j], next[i]];
+    onLayersChange(next);
+  };
+
   const bounds = doc?.bounds;
 
   return (
@@ -79,6 +97,17 @@ export function DxfPanel({
           Open DXF…
         </button>
         <span className="muted">{fileName ?? "(none)"}</span>
+      </div>
+      <div className="row">
+        <label className="chk">
+          <input
+            type="checkbox"
+            checked={disableBiarc}
+            onChange={(e) => setDisableBiarc(e.target.checked)}
+            title="Skip the biarc fitter at parse time. Slower output but no fitter artefacts. Apply by re-opening the DXF."
+          />
+          Disable biarc fit (parse-time)
+        </label>
       </div>
       <div className="row">
         <label>Work area:</label>
@@ -129,6 +158,7 @@ export function DxfPanel({
           <table>
             <thead>
               <tr>
+                <th>#</th>
                 <th></th>
                 <th>color</th>
                 <th>name</th>
@@ -144,6 +174,27 @@ export function DxfPanel({
                 const overridden = l.color != null && l.color.toLowerCase() !== dxfColor.toLowerCase();
                 return (
                 <tr key={l.name}>
+                  <td className="order-cell">
+                    <span className="muted">{i + 1}</span>
+                    <button
+                      type="button"
+                      className="link"
+                      disabled={i === 0}
+                      onClick={() => moveLayer(i, -1)}
+                      title="Cut this layer earlier"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      className="link"
+                      disabled={i === layers.length - 1}
+                      onClick={() => moveLayer(i, 1)}
+                      title="Cut this layer later"
+                    >
+                      ↓
+                    </button>
+                  </td>
                   <td>
                     <input
                       type="checkbox"
@@ -173,29 +224,49 @@ export function DxfPanel({
                   <td>
                     <input
                       type="number"
-                      min={0}
-                      max={1000}
+                      // Intentionally no min/max — those make the browser
+                      // refuse intermediate values (e.g. "1" before the user
+                      // types the trailing "00") and the controlled-state
+                      // re-render snaps the field back, so typing feels
+                      // broken. Clamp on blur instead.
                       value={l.power}
-                      onChange={(e) => updateLayer(i, { power: Number(e.target.value) })}
+                      onChange={(e) => {
+                        const v = e.target.value === "" ? 0 : Number(e.target.value);
+                        if (Number.isFinite(v)) updateLayer(i, { power: v });
+                      }}
+                      onBlur={(e) => {
+                        const v = Math.max(0, Math.min(1000, Number(e.target.value) || 0));
+                        updateLayer(i, { power: v });
+                      }}
                     />
                   </td>
                   <td>
                     <input
                       type="number"
-                      min={100}
-                      max={10000}
                       step={100}
                       value={l.feed}
-                      onChange={(e) => updateLayer(i, { feed: Number(e.target.value) })}
+                      onChange={(e) => {
+                        const v = e.target.value === "" ? 0 : Number(e.target.value);
+                        if (Number.isFinite(v)) updateLayer(i, { feed: v });
+                      }}
+                      onBlur={(e) => {
+                        const v = Math.max(100, Math.min(10000, Number(e.target.value) || 100));
+                        updateLayer(i, { feed: v });
+                      }}
                     />
                   </td>
                   <td>
                     <input
                       type="number"
-                      min={1}
-                      max={20}
                       value={l.passes}
-                      onChange={(e) => updateLayer(i, { passes: Math.max(1, Number(e.target.value)) })}
+                      onChange={(e) => {
+                        const v = e.target.value === "" ? 0 : Number(e.target.value);
+                        if (Number.isFinite(v)) updateLayer(i, { passes: v });
+                      }}
+                      onBlur={(e) => {
+                        const v = Math.max(1, Math.min(20, Number(e.target.value) || 1));
+                        updateLayer(i, { passes: v });
+                      }}
                     />
                   </td>
                 </tr>

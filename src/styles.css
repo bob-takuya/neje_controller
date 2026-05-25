@@ -347,3 +347,29 @@ main {
 .send-row input {
   font-family: ui-monospace, monospace;
 }
+
+/* Order column in the layer table: row number + up/down reorder buttons. */
+.order-cell {
+  white-space: nowrap;
+}
+.order-cell .muted {
+  margin-right: 4px;
+}
+.order-cell button.link {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0 4px;
+  margin-left: 2px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.order-cell button.link:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.order-cell button.link:not(:disabled):hover {
+  background: var(--panel-alt);
+}

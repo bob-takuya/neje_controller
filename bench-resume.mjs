@@ -1,54 +1,42 @@
-// Build a resume program that switches the *active* job from biarc-enabled
-// to biarc-disabled emission, picking up at the line that corresponds to
-// `stopAt` in the current (biarc-enabled) program.
+// Find a resume index in the biarc-disabled program that corresponds to
+// the stop line in the biarc-enabled program.
 //
-// Strategy ("anchor-based"):
+// Strategy ("G0 anchor"):
 //
-//   1. Build the biarc-enabled program A using the same parameters the
-//      running job used.
-//   2. Build the biarc-disabled program B by flattening every arc/circle
-//      shape into a polyline first, then running the same emitter.
-//   3. Filter both A and B to keep only lines that GRBL would actually
-//      consume (`normalize_line` equivalent: strip comments/parens/blanks).
-//      `stopAt` is in filtered-A coordinates because that's what the UI's
-//      progress bar shows.
-//   4. Walk filtered-A and filtered-B in parallel. Any time we see the
-//      same exact filtered line in both at the SAME relative progression,
-//      mark it as an anchor pairing A[i] ↔ B[j]. Lines that differ are
-//      either arc/circle expansions (A: one G2/G3 line, B: many G1 lines)
-//      or whole-line content differences from biarc fitting.
-//   5. Find the latest anchor where A[i] ≤ stopAt. That anchor's B[j] is
-//      where we resume B from.
+//   biarc on  → biarc off changes the shape COUNT and ORDER (the fitter
+//   splits a single SPLINE into many "line + arc" shapes, which the no-
+//   biarc path keeps as one polyline). So line-by-line LCS isn't usable.
 //
-//   The matching loop is a textbook LCS-light: it advances both pointers
-//   on equal lines, and on a mismatch it skips ahead in B (since B has
-//   STRICTLY MORE lines than A wherever an arc/circle was expanded). If
-//   we ever fall off the end of B before A reaches stopAt, the program
-//   ordering assumption is broken and we bail out.
+//   What IS stable across both pipelines:
+//     - The set of "shape origins" — every shape in the layer emits a G0
+//       to its starting MCS coordinate before the cut moves begin.
+//     - The XY coordinate of that G0 is a property of the original DXF
+//       entity (the fitter doesn't move endpoints), so the same G0 line
+//       appears in both A and B, just at different indices.
 //
-// Safety bias: when in doubt prefer redoing a few millimeters of cuts to
-// missing any cuts. The resume index is the line AT the anchor, not
-// after — so the anchor itself gets re-sent. For non-motion anchors
-// (M5, M4 S..., G21, etc.) re-sending is harmless. For G0 anchors at
-// shape boundaries it just re-issues the rapid we already did.
+//   So: walk A up to stopAt and grab the most recent G0 line. Find the
+//   same G0 line in B. That's where we resume.
 //
-// Usage: npx tsx bench-resume.mjs <dxf> <stopAtFilteredIdx> <out.gcode>
+//   Failure mode: if the same G0 appears multiple times in B (separate
+//   shapes happening to start at the same point — rare), we pick the
+//   N-th occurrence where N is the count of identical G0s in A up to
+//   stopAt. That keeps the mapping monotonic.
+//
+// Usage: npx tsx bench-resume.mjs <dxf> <stopAt> <out.gcode>
 
 import fs from "node:fs";
 
-const { parseDxf, flattenShape } = await import("./src/lib/dxf.ts");
+const { parseDxf } = await import("./src/lib/dxf.ts");
 const { buildGCode, defaultLayerParams } =
   await import("./src/lib/gcode.ts");
 
 const [, , dxfPath, stopAtStr, outPath] = process.argv;
 if (!dxfPath || !stopAtStr || !outPath) {
-  console.error("usage: bench-resume.mjs <dxf> <stopAtFilteredIdx> <out.gcode>");
+  console.error("usage: bench-resume.mjs <dxf> <stopAt> <out.gcode>");
   process.exit(1);
 }
 const stopAt = parseInt(stopAtStr, 10);
 
-// Matches GRBL `normalize_line`: strip parenthesized comments, drop after
-// `;`, trim, drop if empty. Returns null for filtered-out lines.
 const normalize = (raw) => {
   let s = "";
   let depth = 0;
@@ -65,161 +53,106 @@ const normalize = (raw) => {
 
 const text = fs.readFileSync(dxfPath, "utf8");
 
-const doc = parseDxf(text);
-const layers = defaultLayerParams(doc);
-
-// User said: Dynamic power ✅, Return-to-origin ✅, Dry-run ✗
 const params = {
-  layers,
   travelFeed: 3000,
   dynamicPower: true,
   returnHome: true,
   placement: { x: 0, y: 0 },
 };
 
-// --- A: biarc-enabled (the running job) ---
-const programA = buildGCode(doc, params);
+const docA = parseDxf(text, { disableBiarc: false });
+const layersA = defaultLayerParams(docA);
+const programA = buildGCode(docA, { ...params, layers: layersA });
 const filteredA = [];
-const filteredAToRaw = []; // map filteredA index → programA index
-for (let i = 0; i < programA.length; i++) {
-  const n = normalize(programA[i]);
-  if (n != null) {
-    filteredA.push(n);
-    filteredAToRaw.push(i);
-  }
+for (const l of programA) {
+  const n = normalize(l);
+  if (n != null) filteredA.push(n);
 }
 console.log(`A raw=${programA.length} filtered=${filteredA.length}`);
 
-// --- B: biarc-disabled (replace arcs/circles with flattened polylines) ---
-const flatDoc = {
-  ...doc,
-  layers: doc.layers.map((layer) => ({
-    ...layer,
-    shapes: layer.shapes.map((s) => {
-      if (s.type === "poly") return s;
-      const points = flattenShape(s);
-      return { type: "poly", points };
-    }),
-  })),
-};
-const programB = buildGCode(flatDoc, params);
+const docB = parseDxf(text, { disableBiarc: true });
+const layersB = defaultLayerParams(docB);
+const programB = buildGCode(docB, { ...params, layers: layersB });
 const filteredB = [];
-const filteredBToRaw = [];
-for (let i = 0; i < programB.length; i++) {
-  const n = normalize(programB[i]);
-  if (n != null) {
-    filteredB.push(n);
-    filteredBToRaw.push(i);
-  }
+for (const l of programB) {
+  const n = normalize(l);
+  if (n != null) filteredB.push(n);
 }
 console.log(`B raw=${programB.length} filtered=${filteredB.length}`);
 
-// --- Anchor scan ----------------------------------------------------------
-// Two pointers a (in filteredA) and b (in filteredB). On equal lines emit
-// an anchor and advance both. On mismatch advance b (B is the "expanded"
-// program with extra G1 sequences inside what was one G2/G3 in A). If b
-// runs to the end we also try advancing a (covers oddities like A having
-// shorter "arc" representations that aren't strictly contained in B).
-// Build a small index: for each filtered B line, the list of indices where
-// it occurs. Lets us, given the next A line we're looking for, find the
-// earliest B occurrence at-or-after our current b in O(log n).
-//
-// Memory: ~93k strings → tens of MB worst case; fine for offline use.
-const bIndex = new Map();
-for (let i = 0; i < filteredB.length; i++) {
-  const v = filteredB[i];
-  let arr = bIndex.get(v);
-  if (!arr) { arr = []; bIndex.set(v, arr); }
-  arr.push(i);
+// In A, find every G0 at-or-before stopAt and record (lineIndex, lineText).
+const G0_RE = /^G0\s/;
+const aG0sBeforeStop = [];
+for (let i = 0; i <= Math.min(stopAt, filteredA.length - 1); i++) {
+  if (G0_RE.test(filteredA[i])) aG0sBeforeStop.push({ i, text: filteredA[i] });
 }
-const earliestBAfter = (line, fromB) => {
-  const arr = bIndex.get(line);
-  if (!arr) return -1;
-  // Binary search the first occurrence >= fromB.
-  let lo = 0, hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (arr[mid] < fromB) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo < arr.length ? arr[lo] : -1;
-};
-
-// Greedy with "look ahead from a, find earliest B match >= b". This is
-// equivalent to walking both pointers and treating B as the "expanded"
-// stream — any A line that has a future B match anchors there. Any A line
-// that DOESN'T appear in B from b onward is dropped (rare, usually the
-// last header line at the very end of the program).
-let a = 0, b = 0;
-let bestAnchorA = -1, bestAnchorB = -1;
-
-while (a < filteredA.length) {
-  const targetB = earliestBAfter(filteredA[a], b);
-  if (targetB >= 0) {
-    // Anchor: A[a] == B[targetB].
-    if (a <= stopAt) {
-      bestAnchorA = a;
-      bestAnchorB = targetB;
-    } else {
-      // We've gone past the stop; no point continuing.
-      break;
-    }
-    a++;
-    b = targetB + 1;
-  } else {
-    // No future occurrence of A[a] in B — skip this A line.
-    a++;
-  }
-}
-
-if (bestAnchorA < 0) {
-  console.error("no anchor before stopAt — order assumption broken");
+if (aG0sBeforeStop.length === 0) {
+  console.error("no G0 found in A before stopAt — can't anchor");
   process.exit(2);
 }
-console.log(
-  `last anchor before stopAt=${stopAt}: A[${bestAnchorA}] ↔ B[${bestAnchorB}]`,
-);
-console.log(`  anchor line content: ${filteredA[bestAnchorA]}`);
-console.log(`  anchor distance from stop: ${stopAt - bestAnchorA} filtered lines`);
+const lastG0A = aG0sBeforeStop[aG0sBeforeStop.length - 1];
 
-// --- Emit resume program --------------------------------------------------
-// We use programB (raw, with comments) as the source so the resume file is
-// human-readable. The anchor's raw index is filteredBToRaw[bestAnchorB].
-const tailStart = filteredBToRaw[bestAnchorB];
-const headerLines = [];
-// Re-emit a small canonical header so modal state is known even if the
-// anchor lands mid-shape (it shouldn't, but defensive).
-for (let i = 0; i < tailStart; i++) {
-  const l = programB[i];
-  if (
-    /^G21\b/.test(l) ||
-    /^G90\b/.test(l) ||
-    /^\$32=1\b/.test(l) ||
-    /^M[345]\b/.test(l)
-  ) {
-    headerLines.push(l);
-  }
+// Count how many times the same G0 text appears in A up to (and including)
+// the lastG0A position. We'll pick the same-numbered occurrence in B.
+let occurrenceCount = 0;
+for (let i = 0; i <= lastG0A.i; i++) {
+  if (filteredA[i] === lastG0A.text) occurrenceCount++;
 }
-// Deduplicate while preserving order.
-const seen = new Set();
-const dedupedHeader = [];
-for (const l of headerLines) {
-  if (!seen.has(l)) {
-    seen.add(l);
-    dedupedHeader.push(l);
+
+// Find the same-numbered occurrence in B.
+let foundCount = 0;
+let bIdx = -1;
+for (let i = 0; i < filteredB.length; i++) {
+  if (filteredB[i] === lastG0A.text) {
+    foundCount++;
+    if (foundCount === occurrenceCount) {
+      bIdx = i;
+      break;
+    }
   }
 }
 
+if (bIdx < 0) {
+  console.error(`G0 anchor "${lastG0A.text}" not found in B (need occurrence ${occurrenceCount})`);
+  process.exit(3);
+}
+
+console.log(`anchor G0: "${lastG0A.text}"`);
+console.log(`  in A at filtered index ${lastG0A.i} (${stopAt - lastG0A.i} lines before stop)`);
+console.log(`  in B at filtered index ${bIdx}`);
+
+// Map back to raw B index. (filteredB was built by walking programB; for
+// the raw index we walk again.)
+let raw = -1;
+let fcount = 0;
+for (let i = 0; i < programB.length; i++) {
+  if (normalize(programB[i]) != null) {
+    if (fcount === bIdx) { raw = i; break; }
+    fcount++;
+  }
+}
+console.log(`  in B raw program at index ${raw}`);
+
+// Emit resume program: minimal header + programB from raw onward.
 const out = [];
-out.push(`; --- RESUME (biarc off) at filtered B[${bestAnchorB}] / raw ${tailStart} ---`);
-out.push(`; matched A[${bestAnchorA}] of ${filteredA.length} (stopAt was ${stopAt})`);
-out.push(`; will redo ${stopAt - bestAnchorA} filtered lines, no gaps`);
+out.push(`; --- RESUME (biarc off) from B[${bIdx}] / raw ${raw} ---`);
+out.push(`; anchor: ${lastG0A.text}`);
+out.push(`; A stopAt=${stopAt}; matched G0 ${stopAt - lastG0A.i} lines before stop`);
 out.push("G21");
 out.push("G90");
 out.push("$32=1");
 out.push("M5");
-for (const l of dedupedHeader) out.push(l);
-for (let i = tailStart; i < programB.length; i++) out.push(programB[i]);
+// Re-arm the most recent M3/M4 from B's header.
+const HEADER_LASER = /^(M3|M4)\b.*\bS\d/;
+for (let i = 0; i < raw; i++) {
+  if (HEADER_LASER.test(programB[i])) {
+    out.push(programB[i]);
+    break;
+  }
+}
+for (let i = raw; i < programB.length; i++) out.push(programB[i]);
 
 fs.writeFileSync(outPath, out.join("\n") + "\n");
-console.log(`wrote ${outPath}: ${out.length} lines`);
+console.log(`wrote ${outPath}: ${out.length} lines (resume into B[${bIdx}])`);
+console.log(`\nIN THE APP: with "Disable biarc fit (parse-time)" ON and the DXF re-opened,`);
+console.log(`Resume at: ${bIdx}`);

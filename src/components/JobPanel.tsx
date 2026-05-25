@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
-import { DxfDocument, flattenShape } from "../lib/dxf";
+import { DxfDocument } from "../lib/dxf";
 import {
   JobParams,
   LayerParams,
@@ -32,10 +32,6 @@ export function JobPanel({
   const [dynamicPower, setDynamicPower] = useState(true);
   const [returnHome, setReturnHome] = useState(true);
   const [dryRun, setDryRun] = useState(false);
-  // Flatten arcs/circles into dense polylines before emitting G-code. Useful
-  // when biarc-fitted arcs render incorrectly (e.g. full-circle bug). With
-  // this on, the program is purely G1/G0 — many more lines, but no G2/G3.
-  const [disableBiarc, setDisableBiarc] = useState(false);
 
   // Local string state for the placement inputs so the user can type freely
   // (including transient invalid states like "" or "-") without fighting
@@ -71,23 +67,6 @@ export function JobPanel({
 
   const program = useMemo(() => {
     if (!doc) return [] as string[];
-    // When biarc is disabled, every arc/circle is replaced with a flattened
-    // polyline so the emitter never sees a G2/G3-eligible shape. The shape
-    // ORDER is preserved, which is what makes anchor-based resume across
-    // biarc-on / biarc-off programs reliable.
-    const effectiveDoc = disableBiarc
-      ? {
-          ...doc,
-          layers: doc.layers.map((layer) => ({
-            ...layer,
-            shapes: layer.shapes.map((s) =>
-              s.type === "poly"
-                ? s
-                : { type: "poly" as const, points: flattenShape(s) },
-            ),
-          })),
-        }
-      : doc;
     const base: JobParams = {
       layers,
       travelFeed,
@@ -95,13 +74,13 @@ export function JobPanel({
       returnHome,
       placement,
     };
-    const lines = buildGCode(effectiveDoc, base);
+    const lines = buildGCode(doc, base);
     if (dryRun) {
       // Replace M3/M4 with M5 so nothing actually fires.
       return lines.map((l) => l.replace(/^(M3|M4)\b.*$/, "M5 ; dry-run"));
     }
     return lines;
-  }, [doc, layers, travelFeed, dynamicPower, returnHome, dryRun, disableBiarc, placement]);
+  }, [doc, layers, travelFeed, dynamicPower, returnHome, dryRun, placement]);
 
   const totalLines = program.length;
 
@@ -116,34 +95,76 @@ export function JobPanel({
 
   // --- Resume from a specific line --------------------------------------
   //
-  // When a job is cancelled or fails partway, the progress bar shows
-  // "sent / total". The user can edit `resumeAt` and press Resume to pick
-  // up from that line (with the header + last-known position re-emitted).
+  // The user can enter any line index and press Resume. We prefill with
+  // `progress.sent` whenever a job stops, but it's editable any time the
+  // job isn't actively running — so an externally-computed resume index
+  // (e.g. from the anchor-based offline tool) can be typed in directly.
+  const [resumeAt, setResumeAt] = useState<string>("0");
+
+  // When the active job is a resume, we want the progress widget to show
+  // (resumeStart + reportedSent) / originalTotal instead of the raw
+  // (sent / resumedLen) the worker reports. Track the offset + the
+  // original length here.
   //
-  // We default to a few lines earlier than the last ack, because the
-  // controller's planner buffer was dropped on soft-reset — any line that
-  // had been "ack'd" but not yet executed needs to be redone.
-  const RESUME_BACKOFF = 5;
-  const [resumeAt, setResumeAt] = useState<string>("");
-  useEffect(() => {
-    // Whenever progress lands on a stopped state, prefill the input with a
-    // safe default. We don't overwrite while the user has it focused —
-    // checking document.activeElement isn't great in React but the simple
-    // heuristic "don't update if there's a value already and user might be
-    // editing" works well enough here.
-    if (!running && progress && progress.sent > 0) {
-      const safe = Math.max(0, progress.sent - RESUME_BACKOFF);
-      setResumeAt(String(safe));
-    }
-  }, [running, progress?.sent]);
+  // - `resumeOffset` is the line index in the ORIGINAL program where the
+  //   resumed stream starts (= the value the user typed in Resume at).
+  // - `resumeTotal` is the length of the ORIGINAL program (so the
+  //   denominator stays meaningful).
+  // - Header lines added by buildResumeProgram (G21/G90/$32=1/M5/G0/M3-M4)
+  //   are NOT part of the original program, so we offset the displayed
+  //   sent by `resumeHeaderLines` so progress doesn't briefly count down
+  //   while the header is being streamed.
+  const [resumeOffset, setResumeOffset] = useState<number | null>(null);
+  const [resumeTotal, setResumeTotal] = useState<number | null>(null);
+  const [resumeHeaderLines, setResumeHeaderLines] = useState<number>(0);
 
   const resumeFromIdx = async () => {
     if (!connected || running || program.length === 0) return;
     const idx = parseInt(resumeAt, 10);
     if (!Number.isFinite(idx) || idx < 0 || idx >= program.length) return;
     const resumed = buildResumeProgram(program, idx);
+    // buildResumeProgram prepends header lines then appends program[idx..].
+    // Header length = resumed.length - (program.length - idx). When the
+    // worker reports `sent`, header lines come first; subsequent lines are
+    // index (idx) + (sent - headerLen) in the original program.
+    const headerLen = Math.max(0, resumed.length - (program.length - idx));
+    setResumeOffset(idx);
+    setResumeTotal(program.length);
+    setResumeHeaderLines(headerLen);
     await api.stream(resumed);
   };
+
+  // Reset the resume-display offsets when a fresh full job is started (a
+  // running job whose reported total matches the current program length is
+  // a normal Start, not a resume).
+  useEffect(() => {
+    if (running && progress && progress.total === program.length) {
+      setResumeOffset(null);
+      setResumeTotal(null);
+      setResumeHeaderLines(0);
+    }
+  }, [running, progress?.total, program.length]);
+
+  // Compute what the progress widget should display.
+  const displayedProgress = useMemo(() => {
+    if (!progress) return null;
+    if (resumeOffset != null && resumeTotal != null) {
+      const sentInTail = Math.max(0, progress.sent - resumeHeaderLines);
+      const sent = Math.min(resumeTotal, resumeOffset + sentInTail);
+      return { sent, total: resumeTotal };
+    }
+    return { sent: progress.sent, total: progress.total };
+  }, [progress, resumeOffset, resumeTotal, resumeHeaderLines]);
+
+  // Prefill the Resume at input with the last displayed-sent value whenever
+  // a job stops. Using displayedProgress (not raw progress) so that after a
+  // resume run stops mid-way, the field shows the original-program index
+  // matching where the head actually is.
+  useEffect(() => {
+    if (!running && displayedProgress && displayedProgress.sent > 0) {
+      setResumeAt(String(displayedProgress.sent));
+    }
+  }, [running, displayedProgress?.sent]);
 
   return (
     <div className="panel job-panel">
@@ -205,14 +226,6 @@ export function JobPanel({
           <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
           Dry-run (laser off)
         </label>
-        <label className="chk">
-          <input
-            type="checkbox"
-            checked={disableBiarc}
-            onChange={(e) => setDisableBiarc(e.target.checked)}
-          />
-          Disable biarc fit (flatten arcs)
-        </label>
       </div>
       <div className="row">
         <button
@@ -226,18 +239,24 @@ export function JobPanel({
           Cancel
         </button>
       </div>
-      {progress && (
+      {displayedProgress && (
         <div className="progress">
           <div
             className="bar"
-            style={{ width: `${progress.total === 0 ? 0 : (progress.sent / progress.total) * 100}%` }}
+            style={{
+              width: `${
+                displayedProgress.total === 0
+                  ? 0
+                  : (displayedProgress.sent / displayedProgress.total) * 100
+              }%`,
+            }}
           />
           <span>
-            {progress.sent} / {progress.total}
+            {displayedProgress.sent} / {displayedProgress.total}
           </span>
         </div>
       )}
-      {progress && progress.sent > 0 && progress.sent < progress.total && (
+      {program.length > 0 && (
         <div className="row resume-row">
           <label>Resume at:</label>
           <input

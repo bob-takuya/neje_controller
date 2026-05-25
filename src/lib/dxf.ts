@@ -720,7 +720,19 @@ const isFlippedExtrusion = (e: any): boolean => {
 
 // --- Main entry ---
 
-export function parseDxf(text: string): DxfDocument {
+export type ParseOptions = {
+  /**
+   * When true, skip the biarc fit pass that converts dense polylines into
+   * line+arc shapes. Useful as an escape hatch when the fitter mis-renders
+   * particular geometry: every arc/circle from the source DXF is preserved,
+   * but SPLINEs / LWPOLYLINEs that we'd normally compress stay as raw
+   * polylines. Combined with the Job-panel "Disable biarc fit" toggle this
+   * gives a pure-G1 pipeline with no fitter artefacts in the chain.
+   */
+  disableBiarc?: boolean;
+};
+
+export function parseDxf(text: string, opts: ParseOptions = {}): DxfDocument {
   const parser = new DxfParserCtor();
   const doc = parser.parseSync(text);
   const layerMeta: Record<string, { color?: number }> = {};
@@ -927,8 +939,16 @@ export function parseDxf(text: string): DxfDocument {
   // and bulge-less LWPOLYLINE) with line + arc shapes. Drops G-code block
   // counts by ~45× on typical CAD/Illustrator/Rhino DXFs, which is what
   // keeps the GRBL planner fed.
-  for (const name of Object.keys(byLayer)) {
-    byLayer[name] = fitLayerShapes(byLayer[name]);
+  //
+  // The pass is skippable so callers that want pure-G1 output (e.g. the
+  // "Disable biarc fit" Job-panel toggle, escape hatch when the fitter
+  // mis-renders a particular DXF) can bypass it without going through
+  // post-hoc flattening — which would otherwise inherit the fitter's bug
+  // because flattenArc reads the (broken) ArcShape produced here.
+  if (!opts.disableBiarc) {
+    for (const name of Object.keys(byLayer)) {
+      byLayer[name] = fitLayerShapes(byLayer[name]);
+    }
   }
 
   // Stitch pass: per layer, chain shapes whose endpoints match. Reorders

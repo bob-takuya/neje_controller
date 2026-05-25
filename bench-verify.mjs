@@ -1,108 +1,142 @@
-// Verify the anchor pairing by walking both programs from a known-good
-// earlier anchor up to the resume index and showing both sides interleaved.
+// Carefully verify the proposed resume index by:
+//  1. Counting how many G0 anchors A and B share up to and including the
+//     proposed anchor. They should match — i.e. the N-th G0 in A is the
+//     same as the N-th G0 in B for N <= ourAnchorN.
+//  2. Dumping the lines AROUND the anchor on both sides so a human can
+//     eyeball alignment.
+//  3. Checking that all G0 lines BEFORE stopAt in A appear (in the same
+//     order, with same N) in B before our resume index.
 //
-// Usage: npx tsx bench-verify.mjs <dxf> <stopAt> <aIdx> <bIdx> <window>
+// Usage: npx tsx bench-verify.mjs <dxf> <stopAt>
 
 import fs from "node:fs";
 
-const { parseDxf, flattenShape } = await import("./src/lib/dxf.ts");
-const { buildGCode, defaultLayerParams } = await import("./src/lib/gcode.ts");
+const { parseDxf } = await import("./src/lib/dxf.ts");
+const { buildGCode, defaultLayerParams } =
+  await import("./src/lib/gcode.ts");
 
-const [, , dxfPath, _stopAt, aIdxStr, bIdxStr, winStr] = process.argv;
-const aIdx = parseInt(aIdxStr, 10);
-const bIdx = parseInt(bIdxStr, 10);
-const win = parseInt(winStr || "100", 10);
+const [, , dxfPath, stopAtStr] = process.argv;
+const stopAt = parseInt(stopAtStr, 10);
 
 const normalize = (raw) => {
-  let s = "";
-  let depth = 0;
+  let s = ""; let d = 0;
   for (const ch of raw) {
-    if (ch === "(") depth++;
-    else if (ch === ")") {
-      if (depth > 0) depth--;
-    } else if (ch === ";" || ch === "\n" || ch === "\r") break;
-    else if (depth === 0) s += ch;
+    if (ch === "(") d++;
+    else if (ch === ")") { if (d > 0) d--; }
+    else if (ch === ";" || ch === "\n" || ch === "\r") break;
+    else if (d === 0) s += ch;
   }
   s = s.trim();
   return s.length === 0 ? null : s;
 };
 
 const text = fs.readFileSync(dxfPath, "utf8");
-const doc = parseDxf(text);
-const layers = defaultLayerParams(doc);
-const params = { layers, travelFeed: 3000, dynamicPower: true, returnHome: true, placement: { x: 0, y: 0 } };
-
-const A = buildGCode(doc, params);
-const fA = []; const fA2raw = [];
-for (let i = 0; i < A.length; i++) { const n = normalize(A[i]); if (n != null) { fA.push(n); fA2raw.push(i); } }
-
-const flatDoc = { ...doc, layers: doc.layers.map((l) => ({ ...l, shapes: l.shapes.map((s) => s.type === "poly" ? s : ({ type: "poly", points: flattenShape(s) })) })) };
-const B = buildGCode(flatDoc, params);
-const fB = []; const fB2raw = [];
-for (let i = 0; i < B.length; i++) { const n = normalize(B[i]); if (n != null) { fB.push(n); fB2raw.push(i); } }
-
-// Print A around aIdx and B around bIdx, side-by-side.
-const aFrom = Math.max(0, aIdx - win);
-const bFrom = Math.max(0, bIdx - win);
-
-// Find anchors in this window (lines equal in filtered space).
-const anchors = [];
-let a = aFrom, b = bFrom;
-const aTo = Math.min(fA.length, aIdx + 5);
-const bTo = Math.min(fB.length, bIdx + 5);
-const aLines = fA.slice(aFrom, aTo);
-const bLines = fB.slice(bFrom, bTo);
-
-// Greedy align inside this window for visualization.
-const bIdxMap = new Map();
-for (let i = 0; i < bLines.length; i++) {
-  let arr = bIdxMap.get(bLines[i]);
-  if (!arr) { arr = []; bIdxMap.set(bLines[i], arr); }
-  arr.push(i);
-}
-const earliestAfter = (line, from) => {
-  const arr = bIdxMap.get(line);
-  if (!arr) return -1;
-  for (const v of arr) if (v >= from) return v;
-  return -1;
+const params = {
+  travelFeed: 3000, dynamicPower: true, returnHome: true,
+  placement: { x: 0, y: 0 },
 };
 
-const pairs = [];
-let bp = 0;
-for (let ap = 0; ap < aLines.length; ap++) {
-  const t = earliestAfter(aLines[ap], bp);
-  if (t >= 0) {
-    pairs.push({ a: aFrom + ap, b: bFrom + t, line: aLines[ap] });
-    bp = t + 1;
+const docA = parseDxf(text, { disableBiarc: false });
+const layersA = defaultLayerParams(docA);
+const programA = buildGCode(docA, { ...params, layers: layersA });
+const filteredA = []; const fA2raw = [];
+for (let i = 0; i < programA.length; i++) {
+  const n = normalize(programA[i]);
+  if (n != null) { filteredA.push(n); fA2raw.push(i); }
+}
+
+const docB = parseDxf(text, { disableBiarc: true });
+const layersB = defaultLayerParams(docB);
+const programB = buildGCode(docB, { ...params, layers: layersB });
+const filteredB = []; const fB2raw = [];
+for (let i = 0; i < programB.length; i++) {
+  const n = normalize(programB[i]);
+  if (n != null) { filteredB.push(n); fB2raw.push(i); }
+}
+
+console.log(`A filtered=${filteredA.length}  B filtered=${filteredB.length}`);
+
+// Extract every G0 line from A (up to stopAt) and B (full).
+const G0_RE = /^G0\s/;
+const aG0 = []; // {idx, text}
+for (let i = 0; i <= Math.min(stopAt, filteredA.length - 1); i++) {
+  if (G0_RE.test(filteredA[i])) aG0.push({ idx: i, text: filteredA[i] });
+}
+const bG0 = [];
+for (let i = 0; i < filteredB.length; i++) {
+  if (G0_RE.test(filteredB[i])) bG0.push({ idx: i, text: filteredB[i] });
+}
+
+console.log(`A: ${aG0.length} G0 lines before stopAt`);
+console.log(`B: ${bG0.length} G0 lines total`);
+
+// Check: do the first `aG0.length` G0 lines in B match A's G0 sequence?
+let matches = 0, mismatches = 0;
+const mismatchExamples = [];
+for (let i = 0; i < aG0.length; i++) {
+  if (i >= bG0.length) { mismatches++; continue; }
+  if (aG0[i].text === bG0[i].text) matches++;
+  else {
+    mismatches++;
+    if (mismatchExamples.length < 10) {
+      mismatchExamples.push({ n: i, a: aG0[i].text, b: bG0[i].text });
+    }
+  }
+}
+console.log("");
+console.log(`G0-by-G0 alignment check: ${matches} match / ${mismatches} mismatch (of ${aG0.length})`);
+if (mismatches > 0) {
+  console.log("  first 10 mismatches:");
+  for (const m of mismatchExamples) {
+    console.log(`    G0 #${m.n}:  A="${m.a}"  B="${m.b}"`);
   }
 }
 
-// Print 10 anchor pairs around the resume point.
-const anchorsBeforeStop = pairs.filter(p => p.a < aIdx).slice(-5);
-const anchorsAt = pairs.filter(p => p.a === aIdx);
-const anchorsAfterStop = pairs.filter(p => p.a > aIdx).slice(0, 3);
-
-console.log("== anchors right before stop ==");
-for (const p of anchorsBeforeStop) console.log(`  A[${p.a}]  ↔  B[${p.b}]  :  ${p.line}`);
-console.log("== anchor AT stop (this is the resume point) ==");
-for (const p of anchorsAt) console.log(`  A[${p.a}]  ↔  B[${p.b}]  :  ${p.line}`);
-console.log("== anchors right after stop ==");
-for (const p of anchorsAfterStop) console.log(`  A[${p.a}]  ↔  B[${p.b}]  :  ${p.line}`);
-
+// Show the last few G0 anchors before stopAt and where they land in B.
 console.log("");
-console.log(`anchor density in window (${aFrom}..${aIdx + 5}, total ${aIdx + 5 - aFrom} A lines):`);
-console.log(`  pairs found: ${pairs.length}`);
-console.log(`  A lines without B match in window: ${aTo - aFrom - pairs.length}`);
-console.log(`  B lines unmatched (likely arc expansions): ${bTo - bFrom - pairs.length}`);
-console.log(`  expansion ratio B/A in window: ${((bTo - bFrom) / (aTo - aFrom)).toFixed(2)}`);
-
-// Show the lines themselves around the anchor pair, side-by-side (10 each).
-console.log("");
-console.log("== last 10 raw lines of programs before the resume point ==");
-const showFromA = fA2raw[aIdx] - 10;
-const showFromB = fB2raw[bIdx] - 10;
-for (let k = 0; k < 12; k++) {
-  const al = A[showFromA + k] ?? "";
-  const bl = B[showFromB + k] ?? "";
-  console.log(`A[${(showFromA + k).toString().padStart(5)}]: ${al.padEnd(45)} | B[${(showFromB + k).toString().padStart(5)}]: ${bl}`);
+console.log("=== last 5 G0s in A before stopAt (and their B match) ===");
+for (const g of aG0.slice(-5)) {
+  // Find the SAME text in B at the same ordinal position.
+  // Ordinal = how many times g.text appears in A up to and including g.idx.
+  let occ = 0;
+  for (let i = 0; i <= g.idx; i++) if (filteredA[i] === g.text) occ++;
+  // Find the occ-th occurrence in B.
+  let count = 0, bIdx = -1;
+  for (let i = 0; i < filteredB.length; i++) {
+    if (filteredB[i] === g.text) {
+      count++;
+      if (count === occ) { bIdx = i; break; }
+    }
+  }
+  console.log(`  A[${g.idx}] "${g.text}"  → B[${bIdx}] (occurrence #${occ})`);
 }
+
+// Dump lines around the proposed anchor.
+// Use the last G0 (the one bench-resume picked).
+const last = aG0[aG0.length - 1];
+let occ = 0;
+for (let i = 0; i <= last.idx; i++) if (filteredA[i] === last.text) occ++;
+let count = 0, anchorBIdx = -1;
+for (let i = 0; i < filteredB.length; i++) {
+  if (filteredB[i] === last.text) {
+    count++;
+    if (count === occ) { anchorBIdx = i; break; }
+  }
+}
+
+console.log("");
+console.log(`=== context around anchor A[${last.idx}] ↔ B[${anchorBIdx}] ===`);
+for (let k = -8; k <= 8; k++) {
+  const aL = filteredA[last.idx + k] ?? "";
+  const bL = filteredB[anchorBIdx + k] ?? "";
+  const tag = k === 0 ? "  ← ANCHOR" : "";
+  console.log(`  k=${k.toString().padStart(3)}: A="${aL.padEnd(40)}" | B="${bL}"${tag}`);
+}
+
+// Last sanity: count lines between A[anchor]..A[stopAt] vs A's prior G0 → stopAt.
+console.log("");
+console.log(`A: ${stopAt - last.idx} lines between anchor and stopAt`);
+// In B, the corresponding tail length starts from anchorBIdx and goes to
+// where stopAt's mirror would be — but since there's no exact mirror in B
+// we just note tail length.
+console.log(`B: resume tail length = ${filteredB.length - anchorBIdx} lines`);
