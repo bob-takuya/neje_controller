@@ -15,6 +15,13 @@ files and G-code to a **NEJE MAX4** laser engraver from macOS. Single-file
 - Dry-run mode (strips M3/M4 so the laser never fires).
 - TX/RX log with raw-G-code send box.
 
+### Beyond the NEJE (added 2026-05/06)
+
+- **Silhouette CAMEO 5 cutter** — a separate libusb worker speaks GPGL to the CAMEO (USB printer-class device), with its own connection bar, layer table and job panel.
+- **Tepra-style label generator** — typed text, GIF frames, or vector glyphs are laid out on a long narrow strip; outlines can be stroked in several inward passes and filled with zigzag, polygon or concentric infill (reimplemented from the published algorithm, no slicer code copied). Multilingual font stack with on-demand CJK loading.
+- **unim → vector paths** — `userscripts/unim-copy-vector.user.js` adds "Copy Vectors" to [baku89's unim](https://baku89.github.io/unim/) so selected glyphs paste into the label generator as exact Bézier paths (no raster jaggies).
+- **ESP32-S3 USB proxy uploader** — sends a job to an ESP32-S3 USB-OTG board over CDC-ACM and tells it to switch to host mode and stream to the engraver, so the job can run without the Mac attached (firmware lives in a separate project).
+
 ## Prerequisites (build machine — macOS)
 
 ```bash
@@ -167,4 +174,4 @@ sizes at build time.
 
 ## License
 
-Personal project. Do what you like with it.
+MIT — see [LICENSE](LICENSE).
