@@ -1,50 +1,63 @@
-# nejemax4-tauri
+# neje_controller (NEJE MAX4 Controller)
 
-A small **Tauri 2** (Rust + React/TypeScript) desktop app for sending DXF
-files and G-code to a **NEJE MAX4** laser engraver from macOS. Single-file
-`.app` bundle, no Python / venv needed at runtime.
+A **Tauri 2** (Rust + React/TypeScript) desktop app for sending DXF files and G-code to a **NEJE MAX4** laser engraver (GRBL), which also grew a **Silhouette CAMEO 5** cutter mode, a Tepra-style label generator and an ESP32-S3 proxy uploader.
 
-## Features
+NEJE MAX4 レーザー彫刻機（＋ Silhouette CAMEO 5）を Mac から動かすための自作コントローラ。
 
-- Port auto-detection (filters to likely USB-CDC engraver ports).
-- `$H` home, `$X` unlock, `G92` set-origin, soft-reset, feed-hold / resume.
-- Arrow-key jog with adjustable step (0.1 – 50 mm) and feed rate.
-- DXF preview with per-layer visibility, color, and live machine-position crosshair.
-- Per-layer cut parameters: laser power, feed, passes, enable/disable.
-- Streaming engine with `ok`-pong handshake, progress, and cancel (feed-hold + soft-reset).
-- Dry-run mode (strips M3/M4 so the laser never fires).
-- TX/RX log with raw-G-code send box.
+## Status
 
-### Beyond the NEJE (added 2026-05/06)
+**Usable for the NEJE MAX4 on the author's setup; everything added later is experimental.** The GRBL/NEJE path has been iterated against the real machine (stall fixes, streaming protocol changes, resume). The CAMEO, label, ESP32 and unim features were added in one batch and have no automated tests. Unsigned builds, placeholder icons, version 0.1.0.
 
-- **Silhouette CAMEO 5 cutter** — a separate libusb worker speaks GPGL to the CAMEO (USB printer-class device), with its own connection bar, layer table and job panel.
-- **Tepra-style label generator** — typed text, GIF frames, or vector glyphs are laid out on a long narrow strip; outlines can be stroked in several inward passes and filled with zigzag, polygon or concentric infill (reimplemented from the published algorithm, no slicer code copied). Multilingual font stack with on-demand CJK loading.
-- **unim → vector paths** — `userscripts/unim-copy-vector.user.js` adds "Copy Vectors" to [baku89's unim](https://baku89.github.io/unim/) so selected glyphs paste into the label generator as exact Bézier paths (no raster jaggies).
-- **ESP32-S3 USB proxy uploader** — sends a job to an ESP32-S3 USB-OTG board over CDC-ACM and tells it to switch to host mode and stream to the engraver, so the job can run without the Mac attached (firmware lives in a separate project).
+✅ **Works (used on the NEJE MAX4)**
+- Serial port auto-detection (CH340/CH343 USB-serial), connect at 115200 baud by default
+- `$H` home, `$X` unlock, `G92` set origin, soft reset, feed hold / cycle start, arrow-key jog with jog-cancel
+- DXF import with per-layer visibility, color, power, feed, passes, enable/disable, and layer cut-order reordering
+- G-code streaming with GRBL **character counting** (120-byte window), progress, cancel (feed hold + soft reset)
+- Dense polylines fitted to arcs + lines (biarc) so the GRBL planner doesn't stall; can be disabled per job
+- M4 kept on for the whole job to avoid per-shape sync stalls
+- Resume a stopped job from a given line
+- Dry run (M3/M4 lines replaced so the laser never fires); laser test-pattern generator; TX/RX log with raw send box
+- Rust unit tests for GRBL line normalisation, ack/error/alarm detection, status parsing and the ESP proxy helpers (`cargo test`)
+
+🚧 **Partial or rough**
+- **Silhouette CAMEO 5** mode (`cameo.rs`, libusb via `rusb`, GPGL): connect, status, jog, home, cut per layer with tool 1/2, speed, force, AutoBlade depth, mat presets. Targets PID `0x1140`; other Graphtec/Silhouette models are only recognised by name, untested
+- **Tepra-style label generator** (CAMEO only): text / GIF frames / vector glyphs on a long strip, inward stroke passes and zigzag / polygon / concentric infill, multilingual font stack with on-demand CJK loading
+- **unim → vector paths**: `userscripts/unim-copy-vector.user.js` adds "Copy Vectors" to [unim](https://baku89.github.io/unim/) so glyphs paste into the label generator as Bézier paths
+- **ESP32-S3 USB proxy uploader** (`esp_proxy.rs`): uploads a job with CRC over CDC-ACM and asks the board to switch to host mode and stream to the engraver. Needs custom firmware that is **not included** in this repo
+- CI release workflow builds macOS / Linux / Windows installers, but only macOS is used day-to-day; Linux/Windows builds are untested on hardware
+
+📝 **Not implemented yet**
+- DXF entities with a non-axis-aligned extrusion direction (full Arbitrary Axis Algorithm) — treated as identity
+- Real app icons (current ones are placeholder red circles)
+- Code signing / notarisation
+- Frontend tests (the `bench-*.mjs` scripts are ad-hoc benchmarks, not a test suite)
+
+⚠️ **Known issues & limitations**
+- Default work area and placement assume the NEJE MAX4 (400 × 400 mm)
+- Unsigned build: Gatekeeper blocks it on first launch (see below)
+- Some `bench-*.mjs` scripts point at local DXF files and won't run as-is
+
+## Background
+
+Started 2026-05 as a single-file `.app` replacement for sending DXF/G-code to the NEJE MAX4 from macOS; the CAMEO / label / ESP32 work followed in 2026-05–06 and was published in 2026-09.
 
 ## Prerequisites (build machine — macOS)
 
 ```bash
-# Xcode command-line tools (once):
-xcode-select --install
-
-# Rust toolchain (once):
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+xcode-select --install                                        # once
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # Rust toolchain
 rustup default stable
-
-# Node 18+ and npm:
-brew install node
+brew install node                                             # Node 18+
 ```
 
 ## Install dependencies
 
 ```bash
-cd nejemax4-tauri
+cd neje_controller
 npm install
 ```
 
-`npm install` pulls in the Tauri CLI, Vite, React, and `dxf-parser`. Nothing
-is global; everything stays in `node_modules/`.
+`npm install` pulls in the Tauri CLI, Vite, React, `dxf-parser`, `clipper-lib` and `opentype.js`. Everything stays in `node_modules/`. The CAMEO backend static-links libusb (`rusb` `vendored`), so no system libusb is needed.
 
 ## Develop (hot-reload)
 
@@ -52,9 +65,7 @@ is global; everything stays in `node_modules/`.
 npx tauri dev
 ```
 
-This runs Vite on `http://127.0.0.1:1420` and spawns the Tauri window. Edits
-to the TS/React sources hot-reload; edits to the Rust sources trigger a
-rebuild.
+Runs Vite on `http://127.0.0.1:1420` and spawns the Tauri window.
 
 ## Build a distributable `.app`
 
@@ -62,99 +73,65 @@ rebuild.
 npx tauri build
 ```
 
-Outputs end up in `src-tauri/target/release/bundle/`:
+Outputs end up in `src-tauri/target/release/bundle/` (`macos/NEJE MAX4 Controller.app` and a `.dmg`).
 
-- `macos/NEJE MAX4 Controller.app` — drop-in `.app` (~10–15 MB release build).
-- `dmg/NEJE MAX4 Controller_0.1.0_<arch>.dmg` — drag-to-install disk image.
-
-### Universal binary (Apple Silicon + Intel)
+Universal binary:
 
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npx tauri build --target universal-apple-darwin
 ```
 
-## Distribute to a few friends (no Apple Developer account needed)
-
-The build above is **unsigned**. On the receiver's Mac, Gatekeeper will
-refuse to run it straight away. Two workarounds:
-
-### Option A — strip the quarantine attribute
-
-After downloading, in Terminal:
+### Running the unsigned build on another Mac
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/NEJE MAX4 Controller.app"
-```
-
-Then double-click the app normally.
-
-### Option B — right-click → Open
-
-1. Drag the app into `/Applications`.
-2. **Right-click** the app → **Open** → **Open** in the dialog.
-3. From then on it launches like any other app.
-
-### Ad-hoc self-signing (optional, prevents "damaged" errors on some Macs)
-
-```bash
+# or: right-click the app → Open → Open
+# optional ad-hoc signature:
 codesign --force --deep -s - "src-tauri/target/release/bundle/macos/NEJE MAX4 Controller.app"
 ```
 
-## USB serial permissions
+## USB permissions
 
-NEJE MAX4 shows up on macOS as `/dev/cu.usbserial-*` or `/dev/cu.wchusbserial*`
-(CH340 / CH343 chip). No driver install needed on macOS 11+. If the port
-doesn't appear:
-
-```bash
-ls /dev/cu.* | grep -iE 'usb|wch'
-```
+- **NEJE MAX4** appears as `/dev/cu.usbserial-*` or `/dev/cu.wchusbserial*` (CH340 / CH343). No driver needed on macOS 11+. Check with `ls /dev/cu.* | grep -iE 'usb|wch'`.
+- **CAMEO 5** is a USB printer-class device (VID `0x0b4d`); it has no `/dev/cu.*` node and is opened directly over libusb. Quit Silhouette Studio first if it holds the device.
 
 ## Project layout
 
 ```
-nejemax4-tauri/
-├── index.html                 ← Vite entry
-├── package.json / tsconfig    ← Frontend build
-├── vite.config.ts
+neje_controller/
+├── index.html, package.json, vite.config.ts, tsconfig*.json
+├── bench-*.mjs                ← ad-hoc G-code / biarc / resume benchmarks
+├── userscripts/               ← unim "Copy Vectors" userscript
 ├── src/                       ← React + TS UI
 │   ├── App.tsx
-│   ├── main.tsx
-│   ├── styles.css
 │   ├── lib/
 │   │   ├── api.ts             ← Tauri IPC bindings
-│   │   ├── dxf.ts             ← DXF parsing (dxf-parser wrapper)
-│   │   └── gcode.ts           ← Polyline → GRBL G-code
-│   └── components/
-│       ├── ConnectionBar.tsx
-│       ├── JogPanel.tsx
-│       ├── DxfPanel.tsx
-│       ├── DxfPreview.tsx     ← Canvas preview w/ layers + crosshair
-│       ├── JobPanel.tsx       ← Start / cancel / dry-run
-│       ├── LogView.tsx        ← TX/RX + send raw
-│       └── PositionReadout.tsx
-└── src-tauri/                 ← Rust backend
-    ├── Cargo.toml
-    ├── tauri.conf.json
-    ├── build.rs
-    ├── capabilities/default.json
-    ├── icons/                 ← placeholder icons (replace with your own)
+│   │   ├── dxf.ts             ← DXF parsing + biarc fit
+│   │   ├── gcode.ts           ← polyline → GRBL G-code (+ resume)
+│   │   ├── testPattern.ts
+│   │   ├── cameoGpgl.ts       ← DXF → GPGL for the CAMEO
+│   │   ├── tepra*.ts, polygonFill.ts, concentricFill.ts, textVector.ts, fontStack.ts
+│   │   └── unimVector.ts
+│   └── components/            ← ConnectionBar, JogPanel, DxfPanel, DxfPreview, JobPanel,
+│                                 LogView, PositionReadout, TestPatternPanel,
+│                                 Cameo*.tsx, TepraPanel
+└── src-tauri/
+    ├── tauri.conf.json, capabilities/, icons/ (placeholders)
     └── src/
         ├── main.rs            ← Tauri commands + wiring
-        ├── state.rs           ← Shared types, events, worker handle
-        ├── grbl.rs            ← GRBL 1.1 protocol helpers + tests
-        └── serial.rs          ← Port enum + streaming worker
+        ├── state.rs           ← shared types, events
+        ├── grbl.rs            ← GRBL 1.1 helpers + tests
+        ├── serial.rs          ← port enumeration + character-counting streamer
+        ├── cameo.rs           ← CAMEO GPGL worker (libusb)
+        └── esp_proxy.rs       ← ESP32-S3 proxy uploader + tests
 ```
 
 ## GRBL notes
 
-- Baud defaults to **115200** — change in the UI if your firmware is different.
-- The streamer uses the "simple" `ok`-pong model, not character counting. This
-  keeps the worker simple and is plenty for a single operator over USB.
-- Cancel = `!` (feed-hold) followed by `Ctrl-X` (soft-reset). The engraver
-  immediately stops and re-homes to a known state.
-- Jog-cancel = `0x85` real-time byte (GRBL 1.1 only).
+- Baud defaults to **115200**.
+- Streaming uses GRBL character counting (per the GRBL streaming wiki): up to 120 bytes of un-acked lines in flight, which keeps the planner fed on small geometry where one-line-per-`ok` round trips cause visible pauses.
+- Cancel = `!` (feed hold) then `Ctrl-X` (soft reset). Jog-cancel = `0x85` (GRBL 1.1).
 
 ## Dev: run Rust tests
 
@@ -163,14 +140,10 @@ cd src-tauri
 cargo test
 ```
 
-Currently covers `grbl::normalize_line`, ack/error/alarm detection, and the
-status-report parser.
+## Related
 
-## Icons
-
-`src-tauri/icons/*` are placeholder red circles with a white slit. Replace
-before a real release; any 512×512 PNG will do — Tauri generates the other
-sizes at build time.
+- [cameo-cut](https://github.com/bob-takuya/cameo-cut) — earlier Python/PyQt6 CAMEO 5 controller (USB + BLE); the CAMEO mode here is the newer Rust/Tauri take
+- [uls-mac-driver](https://github.com/bob-takuya/uls-mac-driver) — experimental macOS driver for ULS laser cutters (same series of Mac fabrication tools)
 
 ## License
 
