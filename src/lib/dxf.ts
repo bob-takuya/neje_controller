@@ -130,20 +130,23 @@ const aciToCss = (aci: number | undefined, fallback = "#cccccc") =>
 
 /**
  * Segments needed to flatten an arc/circle to a chord-tolerance `t` (mm).
- * Used only for preview rendering; G-code uses native G2/G3 and doesn't
- * flatten. Tolerance 0.2mm is invisible on a ~1500px canvas at practical zoom.
+ * The preview default (0.2mm, ≤96 steps) is invisible on a ~1500px canvas;
+ * the laser path uses native G2/G3 and doesn't flatten. A machine WITHOUT
+ * native arcs (the CAMEO cutter) needs a tighter tolerance + higher cap, hence
+ * the parameters — pass e.g. `flatSteps(r, sweep, 0.05, 512)` for cut quality.
  */
-const flatSteps = (r: number, sweepRad: number, tolerance = 0.2) => {
+const flatSteps = (r: number, sweepRad: number, tolerance = 0.2, maxSteps = 96) => {
   const dTheta = Math.sqrt((8 * tolerance) / Math.max(r, 0.1));
   const steps = Math.ceil(Math.abs(sweepRad) / dTheta);
-  return Math.max(8, Math.min(96, steps));
+  return Math.max(8, Math.min(maxSteps, steps));
 };
 
 /**
- * Flatten an arc for preview. Respects the `ccw` direction flag: when false,
- * we sweep from start to end via DECREASING angle (CW).
+ * Flatten an arc. Respects the `ccw` direction flag: when false, we sweep from
+ * start to end via DECREASING angle (CW). `tolerance`/`maxSteps` default to
+ * preview grade; pass tighter values for an actual cut (no native arc).
  */
-export const flattenArc = (a: ArcShape): Polyline => {
+export const flattenArc = (a: ArcShape, tolerance = 0.2, maxSteps = 96): Polyline => {
   const a0 = (a.startDeg * Math.PI) / 180;
   const a1 = (a.endDeg * Math.PI) / 180;
   let sweep = a1 - a0;
@@ -154,7 +157,7 @@ export const flattenArc = (a: ArcShape): Polyline => {
     // Want sweep < 0 (CW decreases angle). If end > start, wrap backward.
     if (sweep >= 0) sweep -= Math.PI * 2;
   }
-  const steps = flatSteps(a.r, sweep);
+  const steps = flatSteps(a.r, sweep, tolerance, maxSteps);
   const pts: Polyline = [];
   for (let i = 0; i <= steps; i++) {
     const ang = a0 + (sweep * i) / steps;
@@ -163,8 +166,8 @@ export const flattenArc = (a: ArcShape): Polyline => {
   return pts;
 };
 
-export const flattenCircle = (c: CircleShape): Polyline => {
-  const steps = flatSteps(c.r, Math.PI * 2);
+export const flattenCircle = (c: CircleShape, tolerance = 0.2, maxSteps = 96): Polyline => {
+  const steps = flatSteps(c.r, Math.PI * 2, tolerance, maxSteps);
   const pts: Polyline = [];
   for (let i = 0; i <= steps; i++) {
     const a = (Math.PI * 2 * i) / steps * (c.ccw ? 1 : -1);
@@ -173,15 +176,19 @@ export const flattenCircle = (c: CircleShape): Polyline => {
   return pts;
 };
 
-/** Flatten any shape for preview/bounds iteration. */
-export const flattenShape = (s: Shape): Polyline => {
+/**
+ * Flatten any shape to a polyline. Default tolerance is preview grade; pass a
+ * tighter `tolerance` + higher `maxSteps` for machines without native arcs
+ * (the CAMEO cutter) so curves aren't visibly faceted.
+ */
+export const flattenShape = (s: Shape, tolerance = 0.2, maxSteps = 96): Polyline => {
   switch (s.type) {
     case "poly":
       return s.points;
     case "arc":
-      return flattenArc(s);
+      return flattenArc(s, tolerance, maxSteps);
     case "circle":
-      return flattenCircle(s);
+      return flattenCircle(s, tolerance, maxSteps);
   }
 };
 
@@ -558,8 +565,72 @@ const stitchShapes = (shapes: Shape[], tol = 0.01): Shape[] => {
   }
 
   // Greedy chain extension on open shapes.
+  //
+  // The naive form scans all `open` shapes for every chain step — O(N²), which
+  // melts on large DXFs (a 114k-POLYLINE + 58k-LINE file has ~170k open shapes
+  // in one layer → ~10^10 comparisons, minutes of frozen UI). Instead we index
+  // every endpoint into a spatial hash (point quantized to a `tol` grid → list
+  // of open-shape indices) and only probe the 3×3 cells around the current
+  // chain end. Average O(1) per lookup → O(N) overall.
+  //
+  // Output is identical to the naive scan: among candidates we always pick the
+  // SMALLEST unused index, and for a given shape a start-point match is
+  // preferred over an end-point match — exactly the old loop's `break` order.
   const used = new Array(open.length).fill(false);
   const ordered: Shape[] = [];
+
+  // Quantize to integer grid cells of size `tol`. Two points within `tol` may
+  // land in the same OR an adjacent cell, so lookups must scan the 3×3
+  // neighbourhood — that's what makes the grid match the `same()` tolerance.
+  const cellKey = (cx: number, cy: number) => cx + "," + cy;
+  const cellOf = (p: [number, number]): [number, number] => [
+    Math.floor(p[0] / tol),
+    Math.floor(p[1] / tol),
+  ];
+
+  // startIndex / endIndex: grid cell → ascending list of open indices whose
+  // start (resp. end) point falls in that cell. Built in index order, so each
+  // bucket is already sorted ascending.
+  const startIndex = new Map<string, number[]>();
+  const endIndex = new Map<string, number[]>();
+  const addTo = (map: Map<string, number[]>, p: [number, number] | null, j: number) => {
+    if (!p) return;
+    const [cx, cy] = cellOf(p);
+    const k = cellKey(cx, cy);
+    const bucket = map.get(k);
+    if (bucket) bucket.push(j);
+    else map.set(k, [j]);
+  };
+  for (let j = 0; j < open.length; j++) {
+    addTo(startIndex, shapeStart(open[j]), j);
+    addTo(endIndex, shapeEnd(open[j]), j);
+  }
+
+  // Smallest unused index in `map` near `pt` whose registered point actually
+  // satisfies `same()` (the 3×3 scan over-approximates; verify each hit). The
+  // `pick` accessor returns the candidate's relevant endpoint for the exact
+  // distance check.
+  const findNearest = (
+    map: Map<string, number[]>,
+    pt: [number, number],
+    pick: (j: number) => [number, number] | null,
+  ): number => {
+    const [bx, by] = cellOf(pt);
+    let best = -1;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = map.get(cellKey(bx + dx, by + dy));
+        if (!bucket) continue;
+        for (const j of bucket) {
+          if (used[j]) continue;
+          if (best !== -1 && j >= best) continue; // can't beat current best
+          const q = pick(j);
+          if (q && same(pt, q)) best = j;
+        }
+      }
+    }
+    return best;
+  };
 
   for (let i = 0; i < open.length; i++) {
     if (used[i]) continue;
@@ -568,14 +639,20 @@ const stitchShapes = (shapes: Shape[], tol = 0.01): Shape[] => {
     let curEnd = shapeEnd(open[i]);
 
     while (curEnd) {
+      // Start-match is preferred over end-match for the SAME shape, matching
+      // the old loop. Across shapes, the smaller index always wins — so a
+      // start-hit only beats an end-hit when its index is ≤ the end-hit's.
+      const startHit = findNearest(startIndex, curEnd, (j) => shapeStart(open[j]));
+      const endHit = findNearest(endIndex, curEnd, (j) => shapeEnd(open[j]));
+
       let next = -1;
       let reverse = false;
-      for (let j = 0; j < open.length; j++) {
-        if (used[j]) continue;
-        const candStart = shapeStart(open[j]);
-        const candEnd = shapeEnd(open[j]);
-        if (candStart && same(curEnd, candStart)) { next = j; break; }
-        if (candEnd && same(curEnd, candEnd)) { next = j; reverse = true; break; }
+      if (startHit !== -1 && (endHit === -1 || startHit <= endHit)) {
+        next = startHit;
+        reverse = false;
+      } else if (endHit !== -1) {
+        next = endHit;
+        reverse = true;
       }
       if (next < 0) break;
       used[next] = true;
@@ -732,9 +809,119 @@ export type ParseOptions = {
   disableBiarc?: boolean;
 };
 
+/**
+ * Coarse phases of a DXF load, in the order they happen. The UI maps these to
+ * a progress label; `ratio` (0..1) is the fraction complete within the phase.
+ */
+export type ParsePhase =
+  | "parsing" // dxf-parser tokenizing the file (one opaque blocking step)
+  | "entities" // walking entities → shapes
+  | "fitting" // biarc fit pass, per layer
+  | "stitching" // endpoint-chaining pass, per layer
+  | "bounds"; // final bounds + layer assembly
+
+export type ParseProgress = { phase: ParsePhase; ratio: number };
+
+/**
+ * Async-yielding variant of {@link parseDxf}. Reports coarse progress through
+ * `onProgress` and `await`s a macrotask between phases (and periodically
+ * inside the long entity loop) so the React UI can repaint a progress bar —
+ * the synchronous `parseDxf` would otherwise freeze the renderer for the whole
+ * parse on large files. The geometry it produces is identical to `parseDxf`.
+ */
+export async function parseDxfAsync(
+  text: string,
+  opts: ParseOptions = {},
+  onProgress?: (p: ParseProgress) => void,
+): Promise<DxfDocument> {
+  // Lets the browser paint between phases. `setTimeout(0)` (a macrotask) is
+  // used rather than a microtask because microtasks run before paint.
+  const yieldToUi = () =>
+    new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const report = (phase: ParsePhase, ratio: number) =>
+    onProgress?.({ phase, ratio });
+
+  report("parsing", 0);
+  await yieldToUi();
+  const parser = new DxfParserCtor();
+  const doc = parser.parseSync(text);
+  report("parsing", 1);
+
+  const { byLayer, layerMeta } = collectLayerMeta(doc);
+  const entities: any[] = doc.entities ?? [];
+  const push = makePush(byLayer);
+
+  // Walk entities in chunks, yielding to the UI between chunks so the bar
+  // animates. ENTITY_CHUNK is large enough that the per-chunk yield overhead
+  // (one macrotask ≈ a few ms) stays negligible next to the parse itself.
+  const ENTITY_CHUNK = 2000;
+  report("entities", 0);
+  for (let i = 0; i < entities.length; i++) {
+    entityToShapes(entities[i], push);
+    if ((i + 1) % ENTITY_CHUNK === 0) {
+      report("entities", (i + 1) / entities.length);
+      await yieldToUi();
+    }
+  }
+  report("entities", 1);
+
+  const layerNames = Object.keys(byLayer);
+
+  if (!opts.disableBiarc) {
+    report("fitting", 0);
+    for (let i = 0; i < layerNames.length; i++) {
+      byLayer[layerNames[i]] = fitLayerShapes(byLayer[layerNames[i]]);
+      report("fitting", (i + 1) / layerNames.length);
+      await yieldToUi();
+    }
+  }
+
+  report("stitching", 0);
+  for (let i = 0; i < layerNames.length; i++) {
+    byLayer[layerNames[i]] = stitchShapes(byLayer[layerNames[i]]);
+    report("stitching", (i + 1) / layerNames.length);
+    await yieldToUi();
+  }
+
+  report("bounds", 0);
+  await yieldToUi();
+  const result = assembleDocument(byLayer, layerMeta);
+  report("bounds", 1);
+  return result;
+}
+
 export function parseDxf(text: string, opts: ParseOptions = {}): DxfDocument {
   const parser = new DxfParserCtor();
   const doc = parser.parseSync(text);
+
+  const { byLayer, layerMeta } = collectLayerMeta(doc);
+  const push = makePush(byLayer);
+  for (const e of doc.entities ?? []) entityToShapes(e, push);
+
+  if (!opts.disableBiarc) {
+    for (const name of Object.keys(byLayer)) {
+      byLayer[name] = fitLayerShapes(byLayer[name]);
+    }
+  }
+  for (const name of Object.keys(byLayer)) {
+    byLayer[name] = stitchShapes(byLayer[name]);
+  }
+  return assembleDocument(byLayer, layerMeta);
+}
+
+const makePush = (byLayer: Record<string, Shape[]>) => (layer: string, shape: Shape) => {
+  if (!byLayer[layer]) byLayer[layer] = [];
+  byLayer[layer].push(shape);
+};
+
+/**
+ * Read the layer table (for ACI colors) and emit the diagnostic per-entity
+ * counts. Shared by the sync and async parse paths.
+ */
+function collectLayerMeta(doc: any): {
+  byLayer: Record<string, Shape[]>;
+  layerMeta: Record<string, { color?: number }>;
+} {
   const layerMeta: Record<string, { color?: number }> = {};
   if (doc?.tables?.layer?.layers) {
     for (const [name, info] of Object.entries<any>(doc.tables.layer.layers)) {
@@ -756,13 +943,46 @@ export function parseDxf(text: string, opts: ParseOptions = {}): DxfDocument {
   // eslint-disable-next-line no-console
   console.log("[parseDxf] entity counts (total / OCS-flipped):", debugCounts);
 
-  const byLayer: Record<string, Shape[]> = {};
-  const push = (layer: string, shape: Shape) => {
-    if (!byLayer[layer]) byLayer[layer] = [];
-    byLayer[layer].push(shape);
-  };
+  return { byLayer: {}, layerMeta };
+}
 
-  for (const e of doc.entities ?? []) {
+/** Finalize bounds + layer ordering. Shared by the sync and async paths. */
+function assembleDocument(
+  byLayer: Record<string, Shape[]>,
+  layerMeta: Record<string, { color?: number }>,
+): DxfDocument {
+  let minX = +Infinity, minY = +Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const shapes of Object.values(byLayer)) {
+    for (const s of shapes) {
+      const b = shapeBounds(s);
+      if (b.minX < minX) minX = b.minX;
+      if (b.minY < minY) minY = b.minY;
+      if (b.maxX > maxX) maxX = b.maxX;
+      if (b.maxY > maxY) maxY = b.maxY;
+    }
+  }
+  if (!isFinite(minX)) {
+    minX = 0; minY = 0; maxX = 0; maxY = 0;
+  }
+
+  const layers: DxfLayer[] = Object.entries(byLayer)
+    .map(([name, shapes]) => ({
+      name,
+      color: aciToCss(layerMeta[name]?.color),
+      shapes,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return { layers, bounds: { minX, minY, maxX, maxY } };
+}
+
+/**
+ * Convert one DXF entity into zero or more Shapes, appending them via `push`.
+ * Pure and synchronous — both `parseDxf` (sync) and `parseDxfAsync` (chunked,
+ * progress-reporting) drive this so the produced geometry is identical.
+ */
+function entityToShapes(e: any, push: (layer: string, shape: Shape) => void): void {
+  {
     const layer = e.layer ?? "0";
     switch (e.type) {
       case "LINE": {
@@ -934,55 +1154,12 @@ export function parseDxf(text: string, opts: ParseOptions = {}): DxfDocument {
         break;
     }
   }
-
-  // Biarc fit pass: replace dense flattened polylines (from SPLINE/ELLIPSE
-  // and bulge-less LWPOLYLINE) with line + arc shapes. Drops G-code block
-  // counts by ~45× on typical CAD/Illustrator/Rhino DXFs, which is what
-  // keeps the GRBL planner fed.
-  //
-  // The pass is skippable so callers that want pure-G1 output (e.g. the
-  // "Disable biarc fit" Job-panel toggle, escape hatch when the fitter
-  // mis-renders a particular DXF) can bypass it without going through
-  // post-hoc flattening — which would otherwise inherit the fitter's bug
-  // because flattenArc reads the (broken) ArcShape produced here.
-  if (!opts.disableBiarc) {
-    for (const name of Object.keys(byLayer)) {
-      byLayer[name] = fitLayerShapes(byLayer[name]);
-    }
-  }
-
-  // Stitch pass: per layer, chain shapes whose endpoints match. Reorders
-  // and merges polylines so the G-code emitter can keep the laser on across
-  // naturally connected paths and skip redundant rapids.
-  for (const name of Object.keys(byLayer)) {
-    byLayer[name] = stitchShapes(byLayer[name]);
-  }
-
-  // Compute document bounds across all shapes.
-  let minX = +Infinity, minY = +Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const shapes of Object.values(byLayer)) {
-    for (const s of shapes) {
-      const b = shapeBounds(s);
-      if (b.minX < minX) minX = b.minX;
-      if (b.minY < minY) minY = b.minY;
-      if (b.maxX > maxX) maxX = b.maxX;
-      if (b.maxY > maxY) maxY = b.maxY;
-    }
-  }
-  if (!isFinite(minX)) {
-    minX = 0; minY = 0; maxX = 0; maxY = 0;
-  }
-
-  const layers: DxfLayer[] = Object.entries(byLayer)
-    .map(([name, shapes]) => ({
-      name,
-      color: aciToCss(layerMeta[name]?.color),
-      shapes,
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  return { layers, bounds: { minX, minY, maxX, maxY } };
 }
+
+// NOTE on the biarc/stitch/bounds passes: they previously lived inline here.
+// They now run in `parseDxf` (sync) and `parseDxfAsync` (chunked), each
+// reusing `fitLayerShapes` / `stitchShapes` / `assembleDocument` so the two
+// paths produce identical documents. See those two functions above.
 
 // --- Transforms ---
 

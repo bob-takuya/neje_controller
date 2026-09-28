@@ -4,12 +4,24 @@ import * as api from "../lib/api";
 type Props = {
   connected: boolean;
   connectedPort: string | null;
+  connKind?: api.PortKind;
   onConnectedChange?: (c: api.ConnState) => void;
 };
 
 const BAUD_CHOICES = [115200, 250000, 500000, 57600, 38400, 19200, 9600];
 
-export function ConnectionBar({ connected, connectedPort }: Props) {
+const kindLabel: Record<api.PortKind, string> = {
+  esp: "ESP Proxy",
+  direct: "Direct (NEJE)",
+  unknown: "Unknown",
+};
+const kindStyle: Record<api.PortKind, React.CSSProperties> = {
+  esp: { background: "#2b6cb0", color: "white" },
+  direct: { background: "#2f855a", color: "white" },
+  unknown: { background: "#718096", color: "white" },
+};
+
+export function ConnectionBar({ connected, connectedPort, connKind = "unknown" }: Props) {
   const [ports, setPorts] = useState<api.PortInfo[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [baud, setBaud] = useState<number>(115200);
@@ -100,9 +112,23 @@ export function ConnectionBar({ connected, connectedPort }: Props) {
         </select>
 
         {connected ? (
-          <button type="button" onClick={disconnect} disabled={busy} className="danger">
-            Disconnect{connectedPort ? ` (${connectedPort})` : ""}
-          </button>
+          <>
+            <span
+              title={`Currently connected as ${kindLabel[connKind]}`}
+              style={{
+                ...kindStyle[connKind],
+                padding: "2px 8px",
+                borderRadius: 4,
+                fontWeight: 600,
+                fontSize: 12,
+              }}
+            >
+              {kindLabel[connKind]}
+            </span>
+            <button type="button" onClick={disconnect} disabled={busy} className="danger">
+              Disconnect{connectedPort ? ` (${connectedPort})` : ""}
+            </button>
+          </>
         ) : (
           <button type="button" onClick={connect} disabled={busy || !selected} className="primary">
             Connect

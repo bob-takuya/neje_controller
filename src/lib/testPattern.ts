@@ -267,6 +267,6 @@ export function generateTestPattern(opts: TestPatternOptions): {
   return {
     doc,
     layers: layerParams,
-    fileName: `test_${powers.length}x${feeds.length}.gen`,
+    fileName: `testpattern.gen`,
   };
 }

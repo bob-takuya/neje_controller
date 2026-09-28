@@ -214,11 +214,21 @@ fn run_worker(
     //
     // So: accumulate into `buf` across timeouts, and only emit / clear when
     // we receive a complete newline-terminated line.
+    // Shared flag the reader thread polls between read_line calls. We flip it
+    // to true when the worker is shutting down so the reader exits and drops
+    // its cloned SerialPort handle — otherwise the OS keeps an exclusive
+    // lock on the device and a subsequent open() (e.g. from the ESP upload
+    // path that disconnects then re-opens the same port) fails with
+    // "Unable to acquire exclusive lock on serial port".
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let reader_stop_for_reader = reader_stop.clone();
+
     let app_for_reader = app.clone();
-    std::thread::spawn(move || {
+    let reader_handle = std::thread::spawn(move || {
         let mut reader = BufReader::new(reader_port);
         let mut buf = String::new();
         loop {
+            if reader_stop_for_reader.load(Ordering::SeqCst) { break; }
             match reader.read_line(&mut buf) {
                 Ok(0) => {
                     // EOF / nothing available — serial port is still alive,
@@ -369,6 +379,20 @@ fn run_worker(
             WorkerCmd::Shutdown => break,
         }
     }
+
+    // Tear the reader down before we drop our own SerialPort. Drop order
+    // matters on macOS — if the cloned handle held by the reader is alive
+    // when our write side drops, the OS sees the kernel-level lock as still
+    // held and a subsequent open() in the same process fails.
+    reader_stop.store(true, Ordering::SeqCst);
+    // Force any pending blocking read in the reader to return so the loop
+    // can observe the stop flag. `clear()` returns control to the OS.
+    let _ = port.clear(serialport::ClearBuffer::All);
+    // Wait for the reader to actually exit (up to ~1s; the read timeout is
+    // 100 ms so it should be well under that).
+    let _ = reader_handle.join();
+    // Now drop our own handle.
+    drop(port);
 
     let _ = app.emit(
         events::CONNECTION,

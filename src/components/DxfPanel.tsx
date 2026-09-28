@@ -2,7 +2,14 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import * as api from "../lib/api";
-import { DxfDocument, flipY, parseDxf, translateDoc } from "../lib/dxf";
+import {
+  DxfDocument,
+  ParsePhase,
+  ParseProgress,
+  flipY,
+  parseDxfAsync,
+  translateDoc,
+} from "../lib/dxf";
 import { LayerParams, defaultLayerParams } from "../lib/gcode";
 
 export type WorkArea = { width: number; height: number };
@@ -15,7 +22,28 @@ type Props = {
   fileName: string | null;
   workArea: WorkArea;
   onWorkAreaChange: (w: WorkArea) => void;
+  /**
+   * Compact mode for the CAMEO cutter: hide the GRBL/laser-specific controls
+   * (work-area probe, layer power/feed table) since the CAMEO has a fixed bed
+   * and its layer params (tool/force/depth) live in the cut-layer table.
+   * Keeps the DXF loader + design-size readout in the SAME position.
+   */
+  compact?: boolean;
+  /**
+   * CAMEO mat preset (mm), shown in compact mode where NEJE has the work-area +
+   * Probe row. Selecting a mat resizes the preview work area.
+   */
+  matPreset?: { width: number; height: number };
+  onMatChange?: (m: { width: number; height: number }) => void;
 };
+
+/** Standard CAMEO cutting-mat sizes (inches → mm). */
+const MAT_PRESETS = [
+  { label: "12 × 12 in", width: 305, height: 305 },
+  { label: "12 × 24 in", width: 305, height: 610 },
+  { label: "8.5 × 11 in", width: 216, height: 279 },
+  { label: "A4 (210 × 297)", width: 210, height: 297 },
+];
 
 /**
  * Normalize a freshly-parsed DXF into "design space":
@@ -30,6 +58,19 @@ const toDesignSpace = (d: DxfDocument): DxfDocument => {
   return translateDoc(flipped, -flipped.bounds.minX, -flipped.bounds.minY);
 };
 
+/** What the load is currently doing, plus 0..1 progress within that step. */
+type LoadProgress = { phase: ParsePhase | "reading" | "normalizing"; ratio: number };
+
+const PHASE_LABEL: Record<LoadProgress["phase"], string> = {
+  reading: "Reading file",
+  parsing: "Parsing DXF",
+  entities: "Building shapes",
+  fitting: "Fitting curves",
+  stitching: "Stitching paths",
+  bounds: "Computing bounds",
+  normalizing: "Normalizing",
+};
+
 export function DxfPanel({
   doc,
   onDocLoaded,
@@ -38,8 +79,12 @@ export function DxfPanel({
   fileName,
   workArea,
   onWorkAreaChange,
+  compact = false,
+  matPreset,
+  onMatChange,
 }: Props) {
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<LoadProgress | null>(null);
   const [err, setErr] = useState<string | null>(null);
   // When true, parseDxf skips the biarc fitter entirely. Escape hatch for
   // DXFs where the fitter mis-renders particular geometry (full-circle bug
@@ -57,8 +102,18 @@ export function DxfPanel({
       });
       if (!picked || typeof picked !== "string") return;
       setBusy(true);
+      setProgress({ phase: "reading", ratio: 0 });
       const text = await readTextFile(picked);
-      const parsed = parseDxf(text, { disableBiarc });
+
+      // parseDxfAsync yields between phases so this callback's state updates
+      // actually repaint the bar mid-parse (a sync parse would freeze the UI).
+      const parsed = await parseDxfAsync(
+        text,
+        { disableBiarc },
+        (p: ParseProgress) => setProgress(p),
+      );
+
+      setProgress({ phase: "normalizing", ratio: 0 });
       const d = toDesignSpace(parsed);
       onDocLoaded(d, picked.split("/").pop() ?? picked);
       onLayersChange(defaultLayerParams(d));
@@ -66,6 +121,7 @@ export function DxfPanel({
       setErr(String(e));
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   };
 
@@ -98,6 +154,26 @@ export function DxfPanel({
         </button>
         <span className="muted">{fileName ?? "(none)"}</span>
       </div>
+      {progress &&
+        (() => {
+          // "reading"/"normalizing" report no real fraction — show a full bar
+          // with just the label; the parse phases drive a real percentage.
+          const indeterminate =
+            progress.phase === "reading" || progress.phase === "normalizing";
+          const pct = Math.round(Math.min(1, Math.max(0, progress.ratio)) * 100);
+          return (
+            <div className="progress" title={PHASE_LABEL[progress.phase]}>
+              <div
+                className="bar"
+                style={{ width: indeterminate ? "100%" : `${pct}%` }}
+              />
+              <span>
+                {PHASE_LABEL[progress.phase]}
+                {indeterminate ? "…" : ` ${pct}%`}
+              </span>
+            </div>
+          );
+        })()}
       <div className="row">
         <label className="chk">
           <input
@@ -109,38 +185,64 @@ export function DxfPanel({
           Disable biarc fit (parse-time)
         </label>
       </div>
-      <div className="row">
-        <label>Work area:</label>
-        <input
-          type="number"
-          min={10}
-          max={2000}
-          step={10}
-          value={workArea.width}
-          onChange={(e) =>
-            onWorkAreaChange({ ...workArea, width: Math.max(10, Number(e.target.value) || 10) })
-          }
-        />
-        <span className="muted">×</span>
-        <input
-          type="number"
-          min={10}
-          max={2000}
-          step={10}
-          value={workArea.height}
-          onChange={(e) =>
-            onWorkAreaChange({ ...workArea, height: Math.max(10, Number(e.target.value) || 10) })
-          }
-        />
-        <span className="muted">mm</span>
-        <button
-          type="button"
-          onClick={() => api.sendLine("$$").catch(() => {})}
-          title="Send $$ — pulls $130/$131 (max travel) from GRBL. Result auto-fills above."
-        >
-          Probe ($$)
-        </button>
-      </div>
+      {compact && onMatChange && (
+        <div className="row">
+          <label>Mat:</label>
+          <select
+            value={matPreset ? `${matPreset.width}x${matPreset.height}` : ""}
+            onChange={(e) => {
+              const m = MAT_PRESETS.find(
+                (p) => `${p.width}x${p.height}` === e.target.value,
+              );
+              if (m) onMatChange({ width: m.width, height: m.height });
+            }}
+            title="Cutting-mat working area (preview only; the cutter bed is fixed)"
+          >
+            {MAT_PRESETS.map((m) => (
+              <option key={m.label} value={`${m.width}x${m.height}`}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+          <span className="muted">
+            {matPreset ? `${matPreset.width}×${matPreset.height} mm` : ""}
+          </span>
+        </div>
+      )}
+      {!compact && (
+        <div className="row">
+          <label>Work area:</label>
+          <input
+            type="number"
+            min={10}
+            max={2000}
+            step={10}
+            value={workArea.width}
+            onChange={(e) =>
+              onWorkAreaChange({ ...workArea, width: Math.max(10, Number(e.target.value) || 10) })
+            }
+          />
+          <span className="muted">×</span>
+          <input
+            type="number"
+            min={10}
+            max={2000}
+            step={10}
+            value={workArea.height}
+            onChange={(e) =>
+              onWorkAreaChange({ ...workArea, height: Math.max(10, Number(e.target.value) || 10) })
+            }
+          />
+          <span className="muted">mm</span>
+          <button
+            type="button"
+            onClick={() => api.sendLine("$$").catch(() => {})}
+            title="Send $$ — pulls $130/$131 (max travel) from GRBL. Result auto-fills above."
+          >
+            Probe ($$)
+          </button>
+        </div>
+      )}
       {bounds && (() => {
         const w = bounds.maxX - bounds.minX;
         const h = bounds.maxY - bounds.minY;
@@ -150,9 +252,15 @@ export function DxfPanel({
           </div>
         );
       })()}
+      {compact && doc && (
+        <div className="hint">
+          Cut layers (tool / force / speed / depth) are set in the CAMEO panel
+          on the left.
+        </div>
+      )}
       {err && <div className="err">{err}</div>}
 
-      {layers.length > 0 && (
+      {!compact && layers.length > 0 && (
         <div className="layers">
           <h4>Layers</h4>
           <table>

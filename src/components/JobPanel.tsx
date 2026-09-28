@@ -11,26 +11,41 @@ import {
 
 type Props = {
   connected: boolean;
+  /** "esp": ESP proxy active. "direct": GRBL direct. */
+  connKind: api.PortKind;
   doc: DxfDocument | null;
+  /** Display name of the loaded design (e.g. the DXF filename). */
+  fileName: string | null;
   layers: LayerParams[];
   progress: api.Progress | null;
   running: boolean;
   placement: Placement;
   onPlacementChange: (p: Placement) => void;
+  /** Set true to pause App's auto-reconnect while we own the port. */
+  autoConnectPausedRef: React.MutableRefObject<boolean>;
 };
 
 export function JobPanel({
   connected,
+  connKind,
   doc,
+  fileName,
   layers,
   progress,
   running,
   placement,
   onPlacementChange,
+  autoConnectPausedRef,
 }: Props) {
+  // "Direct" Start streams over the same serial worker the jog buttons use,
+  // which is exactly the GRBL controller. In ESP-proxy mode there is no live
+  // GRBL serial — the engraver isn't reachable from here until the ESP
+  // reboots into HOST mode — so direct streaming has nowhere to go.
+  const directStreamingAvailable = connected && connKind !== "esp";
+  // The ESP upload path needs an ESP CDC connection.
+  const espActionsAvailable = connected && connKind === "esp";
   const [travelFeed, setTravelFeed] = useState(3000);
   const [dynamicPower, setDynamicPower] = useState(true);
-  const [returnHome, setReturnHome] = useState(true);
   const [dryRun, setDryRun] = useState(false);
 
   // Local string state for the placement inputs so the user can type freely
@@ -71,7 +86,9 @@ export function JobPanel({
       layers,
       travelFeed,
       dynamicPower,
-      returnHome,
+      // The end-of-job return is now unconditional and X-axis only (handled in
+      // buildGCode); this flag no longer gates anything but the type requires it.
+      returnHome: true,
       placement,
     };
     const lines = buildGCode(doc, base);
@@ -80,7 +97,7 @@ export function JobPanel({
       return lines.map((l) => l.replace(/^(M3|M4)\b.*$/, "M5 ; dry-run"));
     }
     return lines;
-  }, [doc, layers, travelFeed, dynamicPower, returnHome, dryRun, placement]);
+  }, [doc, layers, travelFeed, dynamicPower, dryRun, placement]);
 
   const totalLines = program.length;
 
@@ -91,6 +108,83 @@ export function JobPanel({
 
   const cancel = async () => {
     await api.cancelStream();
+  };
+
+  // --- ESP32-S3 proxy upload --------------------------------------------------
+  //
+  // The user picks (or types) the ESP's CDC port, hits "Save to ESP & Run",
+  // and we ship the current `program` over to it. With "auto-run" checked the
+  // board reboots into HOST mode and immediately starts streaming to the
+  // engraver — the PC can then be unplugged.
+  // ESP upload re-uses the same serial port the ConnectionBar already
+  // auto-connected to — there's no separate ESP port picker any more
+  // because the user has no reason to pick a different one.
+  //
+  // Off by default: the intended flow is upload → unplug from PC → plug
+  // into a charger → hold OK on the board to start. Auto-run is only
+  // convenient when the PC stays attached for the whole job.
+  const [espAutoRun, setEspAutoRun] = useState(false);
+  const [espUploading, setEspUploading] = useState(false);
+
+  const espUpload = async () => {
+    if (!espActionsAvailable || program.length === 0 || espUploading) return;
+    setEspUploading(true);
+    // Hold off auto-connect while we own the port. Without this, App.tsx's
+    // 2s reconnect loop wins the race and grabs the port back before
+    // upload_job can call serial open.
+    autoConnectPausedRef.current = true;
+    const name = fileName
+      ? fileName.replace(/\.[^.]+$/, "") // strip extension; ESP adds .gcode
+      : `job`;
+    // Wait until the worker has actually closed the serial port. Just calling
+    // `disconnect()` is a fire-and-forget signal — the worker tears down on
+    // its own thread, and on macOS the OS won't release the exclusive lock
+    // for several hundred ms after that. Hooking the `onConnection` event
+    // tells us when the worker thread emitted "serial port closed", and then
+    // we add a small grace period for the kernel to drop the lock.
+    const waitForClose = (timeoutMs: number) =>
+      new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          unsub.then((fn) => fn());
+          reject(new Error("close timeout"));
+        }, timeoutMs);
+        const unsub = api.onConnection((c) => {
+          if (!c.connected) {
+            clearTimeout(timer);
+            unsub.then((fn) => fn());
+            resolve();
+          }
+        });
+      });
+    try {
+      const info = await api.connectionInfo();
+      if (!info) {
+        throw new Error("not connected");
+      }
+      const [portName] = info;
+      const closed = waitForClose(3000);
+      await api.disconnect();
+      await closed;
+      // macOS releases the exclusive lock a bit after close; give it room.
+      await new Promise<void>((r) => setTimeout(r, 700));
+      // Clear any previously-saved jobs so the HOST-mode firmware never
+      // streams a stale file by accident.
+      try {
+        await api.espWipe(portName);
+      } catch (e) {
+        console.warn("ESP wipe (pre-upload) failed; continuing:", e);
+      }
+      const [bytes, crc] = await api.espUpload(portName, name, program, espAutoRun);
+      console.info(
+        `ESP upload OK: ${name}.gcode, ${bytes} bytes, CRC ${crc.toString(16).padStart(8, "0")}, ` +
+        `${espAutoRun ? "running now" : "armed — RST/charger to run"}`,
+      );
+    } catch (e) {
+      console.error("ESP upload failed:", e);
+    } finally {
+      autoConnectPausedRef.current = false;
+      setEspUploading(false);
+    }
   };
 
   // --- Resume from a specific line --------------------------------------
@@ -215,14 +309,6 @@ export function JobPanel({
           Dynamic power (M4)
         </label>
         <label className="chk">
-          <input
-            type="checkbox"
-            checked={returnHome}
-            onChange={(e) => setReturnHome(e.target.checked)}
-          />
-          Return to origin at end
-        </label>
-        <label className="chk">
           <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
           Dry-run (laser off)
         </label>
@@ -230,8 +316,15 @@ export function JobPanel({
       <div className="row">
         <button
           className="primary"
-          disabled={!connected || totalLines === 0 || running}
+          disabled={!directStreamingAvailable || totalLines === 0 || running}
           onClick={start}
+          title={
+            !connected
+              ? "Connect to the engraver to stream"
+              : connKind === "esp"
+                ? "Direct streaming requires a direct USB connection to NEJE; use 'Save to ESP' below"
+                : `Stream ${totalLines} lines straight to the engraver`
+          }
         >
           Start ({totalLines} lines)
         </button>
@@ -256,6 +349,62 @@ export function JobPanel({
           </span>
         </div>
       )}
+      {/* ESP proxy card — visually separated to make it obvious that this
+          is a different control surface from "Start" above (which streams
+          directly), and only available when an ESP is connected. */}
+      <div
+        className="esp-card"
+        style={{
+          marginTop: 10,
+          padding: 8,
+          borderTop: "2px solid #2b6cb0",
+          background: espActionsAvailable ? "rgba(43,108,176,0.08)" : "transparent",
+          opacity: espActionsAvailable ? 1 : 0.55,
+        }}
+      >
+        <div className="row" style={{ marginBottom: 4 }}>
+          <strong style={{ color: "#2b6cb0" }}>ESP Proxy</strong>
+          <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+            {espActionsAvailable
+              ? "Upload, then RST or hold OK on the board to run"
+              : "Connect an ESP proxy to enable"}
+          </span>
+        </div>
+        <div className="row" style={{ marginBottom: 4 }}>
+          <label>File:</label>
+          <span style={{ fontFamily: "monospace" }}>
+            {fileName ?? <span className="muted">(none loaded)</span>}
+          </span>
+        </div>
+        <div className="row" style={{ flexWrap: "wrap", gap: 4 }}>
+          <label className="chk">
+            <input
+              type="checkbox"
+              checked={espAutoRun}
+              onChange={(e) => setEspAutoRun(e.target.checked)}
+            />
+            Auto-run after upload
+          </label>
+          <button
+            className="primary"
+            disabled={!espActionsAvailable || program.length === 0 || espUploading}
+            onClick={espUpload}
+            title={
+              !espActionsAvailable
+                ? "Connect to the ESP proxy first (auto-connect picks it up when you plug it in)"
+                : espAutoRun
+                  ? "Upload the program then immediately reboot the ESP into HOST mode to stream it"
+                  : "Upload only — unplug from PC, then either plug into a charger or press RST on the board to run"
+            }
+          >
+            {espUploading
+              ? "Uploading…"
+              : espAutoRun
+                ? "Save to ESP & Run"
+                : "Save to ESP"}
+          </button>
+        </div>
+      </div>
       {program.length > 0 && (
         <div className="row resume-row">
           <label>Resume at:</label>

@@ -1,10 +1,17 @@
 import { useMemo, useRef, useEffect, useState } from "react";
 import { DxfDocument, flattenShape, Polyline } from "../lib/dxf";
-import { LayerParams, Placement, toMcs } from "../lib/gcode";
+import { Placement, toMcs } from "../lib/gcode";
+
+/**
+ * The only layer fields the preview reads are name / enabled / color, so it
+ * accepts the structural subset shared by GRBL `LayerParams` and
+ * `CameoLayerParams` — that lets the same canvas render either machine's job.
+ */
+type PreviewLayer = { name: string; enabled: boolean; color?: string };
 
 type Props = {
   doc: DxfDocument | null;
-  layers: LayerParams[];
+  layers: PreviewLayer[];
   /** Work-area size (mm). The rectangle (0,0)→(width,height) is always drawn. */
   workArea: { width: number; height: number };
   /** Current machine position in mm (used if wpos is null). */
@@ -17,6 +24,13 @@ type Props = {
   onPlacementChange?: (p: Placement) => void;
   /** Called with an absolute MCS coordinate when the user clicks empty area. */
   onJogTo?: (x: number, y: number) => void;
+  /**
+   * Screen Y orientation. GRBL/NEJE MCS Y grows UP (back of machine at the top),
+   * so we invert (default true). The CAMEO device Y grows DOWN the media feed,
+   * so its preview must NOT invert — pass false there or the preview shows the
+   * cut upside-down relative to reality.
+   */
+  invertY?: boolean;
 };
 
 const PAD = 20;
@@ -45,31 +59,89 @@ export function DxfPreview({
   placement,
   onPlacementChange,
   onJogTo,
+  invertY = true,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Current MCS-space → screen transform (filled inside the draw effect).
+  // Current MCS-space → screen transform (filled inside the draw effect). This
+  // already folds in the user zoom/pan, so every hit-test that reads it (drag,
+  // jog, hover) works at any zoom level without extra math.
   const xformRef = useRef<{
     scale: number;
     offX: number;
-    // Screen y for MCS y=0. toScreen(mx, my).y = offY - my * scale.
+    // Screen y for MCS y=0. toScreen(mx, my).y = offY + sgnY * my * scale.
     offY: number;
+    // +1 when Y is NOT inverted (CAMEO, Y down), -1 when inverted (GRBL, Y up).
+    sgnY: number;
   } | null>(null);
   const [hoverInDoc, setHoverInDoc] = useState(false);
 
+  // User view transform layered on top of the auto-fit: `zoom` multiplies the
+  // fit scale; `pan` shifts the view in screen pixels. zoom=1 / pan=0 reproduces
+  // the original fit-everything view.
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const MIN_ZOOM = 1;
+  const MAX_ZOOM = 60;
+  const clampZoom = (z: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+  const resetView = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Zoom by a fixed step about the canvas centre (the +/− buttons). Keeping the
+  // centre fixed means pan must scale by the same factor about the centre.
+  const zoomAboutCenter = (factor: number) => {
+    const canvas = canvasRef.current;
+    const cx = (canvas?.clientWidth ?? 0) / 2;
+    const cy = (canvas?.clientHeight ?? 0) / 2;
+    setZoom((z) => {
+      const nz = clampZoom(z * factor);
+      const applied = nz / z;
+      if (applied === 1) return z;
+      setPan((p) => ({
+        x: cx - applied * (cx - p.x),
+        y: cy - applied * (cy - p.y),
+      }));
+      return nz;
+    });
+  };
+
+  // Reset the view whenever a different design loads, so each new doc starts
+  // framed. (Placement drags / position updates keep the current zoom.)
+  useEffect(() => {
+    resetView();
+  }, [doc]);
+
   const layerStateByName = useMemo(() => {
-    const m: Record<string, LayerParams> = {};
+    const m: Record<string, PreviewLayer> = {};
     for (const l of layers) m[l.name] = l;
     return m;
   }, [layers]);
 
-  // Helper: design bounds projected into MCS for drag/hit-test.
+  // Map a design point into the preview's "view" space (then `toScreen` draws
+  // it). GRBL: view == MCS (toMcs, Y grows up). CAMEO: keep the design's own
+  // Y-down orientation so the preview shows the artwork the same way up as the
+  // source DXF *and* as the actual cut (which uses the same X; the device Y is
+  // a vertical placement handled by `toScreen`'s non-inverted axis). Only X
+  // carries the placement offset for CAMEO — vertical position on the media
+  // isn't meaningful to preview at the artwork's own scale.
+  const designToView = (dx: number, dy: number): [number, number] =>
+    invertY ? toMcs(placement, dx, dy) : [placement.x + dx, dy];
+
+  // Helper: design bounds projected into view space for drag/hit-test.
   const docMcsBounds = useMemo(() => {
     if (!doc) return null;
     const b = doc.bounds;
-    const [x0, y1] = toMcs(placement, b.minX, b.minY); // design minY → MCS y_max
-    const [x1, y0] = toMcs(placement, b.maxX, b.maxY); // design maxY → MCS y_min
-    return { minX: x0, maxX: x1, minY: y0, maxY: y1 };
-  }, [doc, placement]);
+    const [x0, ya] = designToView(b.minX, b.minY);
+    const [x1, yb] = designToView(b.maxX, b.maxY);
+    return {
+      minX: Math.min(x0, x1),
+      maxX: Math.max(x0, x1),
+      minY: Math.min(ya, yb),
+      maxY: Math.max(ya, yb),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc, placement, invertY]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -104,18 +176,30 @@ export function DxfPreview({
     }
     const fw = Math.max(1e-3, fx1 - fx0);
     const fh = Math.max(1e-3, fy1 - fy0);
-    const scale = Math.min((cssW - PAD * 2) / fw, (cssH - PAD * 2) / fh);
-    const offX = (cssW - fw * scale) / 2 - fx0 * scale;
-    // MCS Y=fy1 should draw at the top of the frame; MCS Y=fy0 at the bottom.
-    // screen_y = offY - mcs_y * scale  →  at mcs_y = fy1, screen_y = offY - fy1*scale = top.
-    const topPad = (cssH - fh * scale) / 2;
-    const offY = topPad + fy1 * scale;
+    const fitScale = Math.min((cssW - PAD * 2) / fw, (cssH - PAD * 2) / fh);
+    const fitOffX = (cssW - fw * fitScale) / 2 - fx0 * fitScale;
+    const topPad = (cssH - fh * fitScale) / 2;
+    // GRBL (invertY): MCS Y grows up, so Y=fy1 (back) draws at the top.
+    //   screen_y = offY - my*scale, offY = topPad + fy1*scale.
+    // CAMEO (!invertY): device Y grows down the feed, so Y=fy0 draws at the top.
+    //   screen_y = offY + my*scale, offY = topPad - fy0*scale.
+    const sgnY = invertY ? -1 : 1;
+    const fitOffY = invertY ? topPad + fy1 * fitScale : topPad - fy0 * fitScale;
 
-    xformRef.current = { scale, offX, offY };
+    // Apply the user view transform: scale the whole fit image by `zoom` and
+    // translate by `pan` (screen px). i.e. effective = fit*zoom + pan. This
+    // exact form is what makes the cursor-anchored zoom math (in the wheel /
+    // button handlers: pan' = cursor - applied*(cursor - pan)) keep the point
+    // under the cursor fixed.
+    const scale = fitScale * zoom;
+    const offX = fitOffX * zoom + pan.x;
+    const offY = fitOffY * zoom + pan.y;
+
+    xformRef.current = { scale, offX, offY, sgnY };
 
     const toScreen = (mx: number, my: number): [number, number] => [
       mx * scale + offX,
-      offY - my * scale,
+      offY + sgnY * my * scale,
     ];
 
     // --- Grid inside the work area ---
@@ -161,12 +245,15 @@ export function DxfPreview({
       wRectX + 4,
       wRectY + 4,
     );
-    // Axis hints so the operator knows which edge is which in MCS.
+    // Axis hints so the operator knows which edge is which. GRBL MCS Y grows
+    // up (back at top); CAMEO device Y grows down the feed (origin at top).
     ctx.fillStyle = "#888";
     ctx.textAlign = "center";
-    ctx.fillText("Y+ (back)", (wRectX + wRectX + wRectW) / 2, wRectY - 14);
+    const topLabel = invertY ? "Y+ (back)" : "Y=0 (media origin)";
+    const botLabel = invertY ? "Y=0 (front)" : "Y+ (feed →)";
+    ctx.fillText(topLabel, (wRectX + wRectX + wRectW) / 2, wRectY - 14);
     ctx.textBaseline = "bottom";
-    ctx.fillText("Y=0 (front)", (wRectX + wRectX + wRectW) / 2, wRectY + wRectH + 14);
+    ctx.fillText(botLabel, (wRectX + wRectX + wRectW) / 2, wRectY + wRectH + 14);
     ctx.textBaseline = "top";
 
     // --- DXF ---
@@ -210,7 +297,7 @@ export function DxfPreview({
           const poly = flattenShape(shape);
           ctx.beginPath();
           for (let i = 0; i < poly.length; i++) {
-            const [mx, my] = toMcs(placement, poly[i][0], poly[i][1]);
+            const [mx, my] = designToView(poly[i][0], poly[i][1]);
             const [sx, sy] = toScreen(mx, my);
             if (i === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
@@ -223,7 +310,7 @@ export function DxfPreview({
     // --- First cut point (yellow) — in MCS ---
     if (doc) {
       const byName: Record<string, Polyline[]> = {};
-      for (const l of doc.layers) byName[l.name] = l.shapes.map(flattenShape);
+      for (const l of doc.layers) byName[l.name] = l.shapes.map((s) => flattenShape(s));
       let firstPt: [number, number] | null = null;
       for (const lp of layers) {
         if (!lp.enabled) continue;
@@ -238,7 +325,7 @@ export function DxfPreview({
         if (firstPt) break;
       }
       if (firstPt) {
-        const [mx, my] = toMcs(placement, firstPt[0], firstPt[1]);
+        const [mx, my] = designToView(firstPt[0], firstPt[1]);
         const [sx, sy] = toScreen(mx, my);
         ctx.fillStyle = "#ffd43b";
         ctx.strokeStyle = "#1a1a1a";
@@ -251,7 +338,7 @@ export function DxfPreview({
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
         ctx.fillText(
-          `start MCS (${mx.toFixed(1)}, ${my.toFixed(1)})`,
+          `start ${invertY ? "MCS" : ""} (${mx.toFixed(1)}, ${my.toFixed(1)})`,
           sx + 8,
           sy + 8,
         );
@@ -271,7 +358,7 @@ export function DxfPreview({
     ctx.fillStyle = "#ff6b6b";
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillText("MCS 0,0 (front-left)", ox + 6, oy + 6);
+    ctx.fillText(invertY ? "MCS 0,0 (front-left)" : "0,0 (media origin)", ox + 6, oy + 6);
 
     // --- Head position crosshair ---
     if (head) {
@@ -324,7 +411,41 @@ export function DxfPreview({
     workArea,
     placement,
     hoverInDoc,
+    invertY,
+    zoom,
+    pan,
   ]);
+
+  // --- Zoom (mouse wheel, toward the cursor) ---------------------------------
+  // Attached as a NON-passive native listener so preventDefault() stops the page
+  // from scrolling while zooming the canvas.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left; // cursor in canvas px
+      const my = e.clientY - rect.top;
+      // Zoom factor per wheel notch; trackpads send small deltas, mice ~100.
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      setZoom((z) => {
+        const nz = clampZoom(z * factor);
+        const applied = nz / z; // actual zoom change after clamping
+        if (applied === 1) return z;
+        // Keep the point under the cursor fixed: pan so the cursor's content
+        // doesn't move. New pan = cursor - applied*(cursor - oldPanAnchor),
+        // expressed incrementally about the cursor.
+        setPan((p) => ({
+          x: mx - applied * (mx - p.x),
+          y: my - applied * (my - p.y),
+        }));
+        return nz;
+      });
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, []);
 
   // --- Mouse interaction -----------------------------------------------------
   const dragRef = useRef<
@@ -340,6 +461,13 @@ export function DxfPreview({
       }
   >(null);
 
+  // Panning the view: middle-button drag, or shift+left-drag. Tracks the raw
+  // client position so we add screen-pixel deltas straight onto `pan`.
+  const panRef = useRef<
+    | null
+    | { startClientX: number; startClientY: number; startPan: { x: number; y: number } }
+  >(null);
+
   const mcsFromEvent = (
     e: React.MouseEvent<HTMLCanvasElement>,
   ): [number, number] | null => {
@@ -349,7 +477,8 @@ export function DxfPreview({
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
-    return [(sx - xf.offX) / xf.scale, (xf.offY - sy) / xf.scale];
+    // Inverse of toScreen: screen_y = offY + sgnY*my*scale → my = sgnY*(sy-offY)/scale.
+    return [(sx - xf.offX) / xf.scale, (xf.sgnY * (sy - xf.offY)) / xf.scale];
   };
 
   const inDocMcs = (x: number, y: number) => {
@@ -363,6 +492,16 @@ export function DxfPreview({
   };
 
   const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Pan with middle-button or shift+left-drag (works at any zoom, including 1).
+    if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+      e.preventDefault();
+      panRef.current = {
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startPan: pan,
+      };
+      return;
+    }
     if (e.button !== 0) return;
     const mcs = mcsFromEvent(e);
     if (!mcs) return;
@@ -376,6 +515,16 @@ export function DxfPreview({
   };
 
   const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Active pan takes precedence over everything else.
+    const pn = panRef.current;
+    if (pn) {
+      setPan({
+        x: pn.startPan.x + (e.clientX - pn.startClientX),
+        y: pn.startPan.y + (e.clientY - pn.startClientY),
+      });
+      return;
+    }
+
     const mcs = mcsFromEvent(e);
     if (!mcs) return;
 
@@ -406,6 +555,10 @@ export function DxfPreview({
   };
 
   const onMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (panRef.current) {
+      panRef.current = null;
+      return;
+    }
     const d = dragRef.current;
     dragRef.current = null;
     if (!d) return;
@@ -428,6 +581,7 @@ export function DxfPreview({
 
   const onMouseLeave = () => {
     dragRef.current = null;
+    panRef.current = null;
     setHoverInDoc(false);
   };
 
@@ -441,6 +595,24 @@ export function DxfPreview({
         onMouseLeave={onMouseLeave}
         style={{ cursor: hoverInDoc ? "grab" : onJogTo ? "crosshair" : "default" }}
       />
+      <div className="zoom-controls">
+        <button onClick={() => zoomAboutCenter(1 / 1.4)} title="縮小 (ホイール下)">
+          −
+        </button>
+        <span className="zoom-level" title="ホイールで拡大縮小 / 中ボタン・Shift+ドラッグで移動">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button onClick={() => zoomAboutCenter(1.4)} title="拡大 (ホイール上)">
+          +
+        </button>
+        <button
+          onClick={resetView}
+          disabled={zoom === 1 && pan.x === 0 && pan.y === 0}
+          title="全体表示にリセット"
+        >
+          ⤢
+        </button>
+      </div>
     </div>
   );
 }

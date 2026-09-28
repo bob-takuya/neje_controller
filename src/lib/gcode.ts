@@ -280,11 +280,11 @@ export function buildGCode(doc: DxfDocument, params: JobParams): string[] {
     if (!dynamic) out.push("M5");
   }
 
-  if (params.returnHome) {
-    out.push(
-      `G0 X${fmt(placement.x)} Y${fmt(placement.y)} F${fmt(params.travelFeed, 0)}`,
-    );
-  }
+  // Always return to the origin X at the end, but X-axis only — leave Y where
+  // the job finished so the head clears to the side without dragging the media
+  // back. (The old `returnHome` checkbox is intentionally ignored here: per the
+  // user's request the return is unconditional and limited to X.)
+  out.push(`G0 X${fmt(placement.x)} F${fmt(params.travelFeed, 0)}`);
   out.push("M5");
 
   return out;

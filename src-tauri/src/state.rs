@@ -12,6 +12,8 @@ pub mod events {
     pub const CONNECTION: &str = "connection";
     pub const PROGRESS: &str = "progress";
     pub const FINISHED: &str = "finished";
+    /// Emitted when the native Tools menu picks a tool (payload: tool key).
+    pub const TOOL_SELECTED: &str = "tool-selected";
 }
 
 /// A log line emitted to the UI (console-style).

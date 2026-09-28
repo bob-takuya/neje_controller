@@ -19,6 +19,12 @@ tauri-plugin-fs = "2.0"
 # Serial I/O (pure Rust; works cross-platform)
 serialport = "4.5"
 
+# Raw USB bulk transport for the Silhouette CAMEO 5 cutter. The CAMEO is a
+# USB *printer-class* device (VID 0x0b4d / PID 0x1140) with no /dev/cu.* node,
+# so `serialport` can't reach it — we talk libusb bulk to interface 0 directly.
+# `vendored` static-links libusb so there's no system dependency on macOS.
+rusb = { version = "0.9", features = ["vendored"] }
+
 # Async runtime for the stream worker
 tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 
@@ -39,6 +45,11 @@ once_cell = "1.20"
 # Better error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# GIF decoding for the tepra "GIF" source. The webview's WebCodecs ImageDecoder
+# isn't enabled in WKWebView/WebView2, so frames are decoded here (pure Rust)
+# and handed to the frontend as packed 1-bit black masks.
+gif = "0.13"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
