@@ -2,10 +2,12 @@ import fs from "node:fs";
 const { parseDxf } = await import("./src/lib/dxf.ts");
 const { buildGCode, defaultLayerParams } = await import("./src/lib/gcode.ts");
 
-const text = fs.readFileSync(
-  "~/20260423neje/2a_thinframe_withbango.dxf",
-  "utf8",
-);
+const input = process.argv[2];
+if (!input) {
+  console.error("usage: node bench-totals.mjs <file.dxf>");
+  process.exit(1);
+}
+const text = fs.readFileSync(input, "utf8");
 const doc = parseDxf(text);
 const layers = defaultLayerParams(doc);
 

@@ -8,7 +8,7 @@ NEJE MAX4 レーザー彫刻機（＋ Silhouette CAMEO 5）を Mac から動か�
 
 **Usable for the NEJE MAX4 on the author's setup; everything added later is experimental.** The GRBL/NEJE path has been iterated against the real machine (stall fixes, streaming protocol changes, resume). The CAMEO, label, ESP32 and unim features were added in one batch and have no automated tests. Unsigned builds, placeholder icons, version 0.1.0.
 
-✅ **Works (used on the NEJE MAX4)**
+**Works (used on the NEJE MAX4)**
 - Serial port auto-detection (CH340/CH343 USB-serial), connect at 115200 baud by default
 - `$H` home, `$X` unlock, `G92` set origin, soft reset, feed hold / cycle start, arrow-key jog with jog-cancel
 - DXF import with per-layer visibility, color, power, feed, passes, enable/disable, and layer cut-order reordering
@@ -19,20 +19,20 @@ NEJE MAX4 レーザー彫刻機（＋ Silhouette CAMEO 5）を Mac から動か�
 - Dry run (M3/M4 lines replaced so the laser never fires); laser test-pattern generator; TX/RX log with raw send box
 - Rust unit tests for GRBL line normalisation, ack/error/alarm detection, status parsing and the ESP proxy helpers (`cargo test`)
 
-🚧 **Partial or rough**
+**Partial or rough**
 - **Silhouette CAMEO 5** mode (`cameo.rs`, libusb via `rusb`, GPGL): connect, status, jog, home, cut per layer with tool 1/2, speed, force, AutoBlade depth, mat presets. Targets PID `0x1140`; other Graphtec/Silhouette models are only recognised by name, untested
 - **Tepra-style label generator** (CAMEO only): text / GIF frames / vector glyphs on a long strip, inward stroke passes and zigzag / polygon / concentric infill, multilingual font stack with on-demand CJK loading
 - **unim → vector paths**: `userscripts/unim-copy-vector.user.js` adds "Copy Vectors" to [unim](https://baku89.github.io/unim/) so glyphs paste into the label generator as Bézier paths
 - **ESP32-S3 USB proxy uploader** (`esp_proxy.rs`): uploads a job with CRC over CDC-ACM and asks the board to switch to host mode and stream to the engraver. Needs custom firmware that is **not included** in this repo
 - CI release workflow builds macOS / Linux / Windows installers, but only macOS is used day-to-day; Linux/Windows builds are untested on hardware
 
-📝 **Not implemented yet**
+**Not implemented yet**
 - DXF entities with a non-axis-aligned extrusion direction (full Arbitrary Axis Algorithm) — treated as identity
 - Real app icons (current ones are placeholder red circles)
 - Code signing / notarisation
 - Frontend tests (the `bench-*.mjs` scripts are ad-hoc benchmarks, not a test suite)
 
-⚠️ **Known issues & limitations**
+**Known issues & limitations**
 - Default work area and placement assume the NEJE MAX4 (400 × 400 mm)
 - Unsigned build: Gatekeeper blocks it on first launch (see below)
 - Some `bench-*.mjs` scripts point at local DXF files and won't run as-is
